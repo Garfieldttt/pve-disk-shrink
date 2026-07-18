@@ -1,11 +1,12 @@
 #!/bin/bash
 # pve-disk-shrink.sh - Shrink a Proxmox VM disk fully offline from the host.
 #
-# Performs the complete shrink without GParted: force fsck, shrink the filesystem
-# (ext4 or guest LVM), shrink the last partition (preserving PARTUUID), shrink the
-# backing block device (ZFS zvol or qcow2), fix the GPT backup header, and sync the
-# VM config. Auto-discovers the boot disk, storage backend and partition layout, and
-# refuses to make the disk smaller than the data plus a chosen headroom.
+# Performs the complete shrink without GParted: resize the filesystem (ext2/3/4, NTFS
+# or guest LVM), shrink the chosen partition (preserving its GUIDs), move any partitions
+# after it down (order kept), shrink the backing block device (ZFS zvol / qcow2 / raw LV),
+# fix the GPT backup header, and sync the VM config. Auto-discovers the storage backend
+# and partition layout, lets you pick the disk and partition, and refuses to make the
+# disk smaller than the data plus a chosen headroom.
 #
 # Usage:
 #   pve-disk-shrink.sh                 interactive dialog TUI
@@ -22,7 +23,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.0.0"
+VERSION="1.1.0"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -39,7 +40,6 @@ PROTECTION_VMID=""    # VM whose protection flag we disabled and must re-enable
 GAUGE_FD=""           # open write fd to the progress gauge, when one is running
 GAUGE_PID=""
 GAUGE_FIFO=""
-TMPFILES=()
 
 # ---------------------------------------------------------------------------
 # Logging / error handling
@@ -96,13 +96,8 @@ cleanup() {
         qemu-nbd -d "$NBD_DEV" >>"$LOGFILE" 2>&1 || true
         NBD_DEV=""
     fi
-    local f
-    for f in "${TMPFILES[@]:-}"; do [[ -n "$f" && -e "$f" ]] && rm -f "$f"; done
-    TMPFILES=()
 }
 trap cleanup EXIT
-
-mktmp() { local f; f=$(mktemp /tmp/pve-disk-shrink.XXXXXX); TMPFILES+=("$f"); printf '%s' "$f"; }
 
 # ---------------------------------------------------------------------------
 # dialog wrappers (each swallows the cancel exit code; return 1 on cancel)
@@ -171,9 +166,24 @@ gauge_wait() {
 # ---------------------------------------------------------------------------
 # Size helpers (work in bytes; align / round conservatively)
 # ---------------------------------------------------------------------------
-MIB=$((1024*1024)); GIB=$((1024*1024*1024))
+MIB=$((1024*1024))
 human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
 roundup() { local v=$1 a=$2; echo $(( (v + a - 1) / a * a )); }   # round v up to multiple of a
+
+# Ensure a command is available, offering to install its package first. Always asks
+# before installing anything; dies if the user declines or the install fails.
+ensure_pkg() {
+    local cmd=$1 pkg=$2 purpose=$3
+    command -v "$cmd" >/dev/null && return 0
+    if [[ -t 1 || -t 2 ]]; then
+        d_yesno "Install $pkg?" "$purpose needs '$cmd' from the package '$pkg', which is not installed on this host.\n\nInstall it now with apt?" \
+            || die "$cmd not found. Install the $pkg package first (apt install $pkg)."
+    else
+        die "$cmd not found. Install the $pkg package first (apt install $pkg)."
+    fi
+    apt-get install -y "$pkg" >>"$LOGFILE" 2>&1 || die "apt install $pkg failed. Install it manually."
+    command -v "$cmd" >/dev/null || die "$cmd still not available after installing $pkg."
+}
 
 # ---------------------------------------------------------------------------
 # Preconditions
@@ -243,10 +253,48 @@ select_disk() {
     d_menu "Select disk on VM $vmid" "A VM can have several disks. Pick the one to shrink.\nefidisk, tpmstate, cloudinit and CD drives are never listed." 12 "${args[@]}"
 }
 
+# Dialog to pick which partition to shrink. Lists every partition with its size and
+# filesystem note; only shrinkable ones (ext / NTFS / LVM) can be chosen. Runs after
+# analyze (needs ALL_PARTS and SECTOR_SIZE). No prompt for whole-disk or when there is
+# only a single shrinkable partition.
+select_partition() {
+    [[ ${NO_GPT:-0} -eq 0 ]] || return 0
+    local line n s e fs shrinkable=0 has_bl=0
+    for line in "${ALL_PARTS[@]}"; do
+        IFS=$'\t' read -r n s e fs <<<"$line"
+        fs_shrinkable "$fs" && shrinkable=$((shrinkable+1))
+        [[ "$fs" == BitLocker ]] && has_bl=1
+    done
+    # On a BitLocker disk the real target (C:) is locked and the only shrinkable thing is
+    # usually the tiny recovery partition, which nobody wants. Show the hint and force a
+    # conscious choice instead of silently defaulting to recovery.
+    (( has_bl )) && bitlocker_note
+    [[ $shrinkable -ge 1 ]] || die "No shrinkable partition on this disk."
+    [[ $shrinkable -eq 1 && $has_bl -eq 0 ]] && return 0
+    while true; do
+        local args=() sizeh sel selfs=""
+        for line in "${ALL_PARTS[@]}"; do
+            IFS=$'\t' read -r n s e fs <<<"$line"
+            sizeh=$(human $(( (e - s + 1) * SECTOR_SIZE )))
+            args+=("$n" "part$n  $sizeh  $(fs_note "$fs")")
+        done
+        sel=$(dialog --backtitle "$BACKTITLE" --title "Select partition on $DISK_KEY" --default-item "$LAST_N" \
+            --menu "Pick the partition to shrink. Partitions after it keep their order and are moved down." \
+            20 82 12 "${args[@]}" 3>&1 1>&2 2>&3) || { detach_disk; clear; exit 0; }
+        for line in "${ALL_PARTS[@]}"; do IFS=$'\t' read -r n s e fs <<<"$line"; [[ "$n" == "$sel" ]] && selfs=$fs; done
+        if fs_shrinkable "$selfs"; then choose_partition "$sel"; return 0; fi
+        if [[ "$selfs" == BitLocker ]]; then
+            bitlocker_note
+        else
+            d_msg "Not shrinkable" "part$sel is $(fs_note "$selfs") and cannot be shrunk. Pick another partition."
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Discover backend for a chosen disk key
 # ---------------------------------------------------------------------------
-# Sets: DISK_KEY DISK_VOL DISK_PATH BACKEND (zvol|qcow2|rawlv) ZPOOL ZVOL VOLBLK CFG_SIZE
+# Sets: DISK_KEY DISK_VOL DISK_PATH BACKEND (zvol|qcow2|rawlv) ZVOL VOLBLK CFG_SIZE
 discover_disk() {
     local vmid=$1 diskkey=$2 cfg
     cfg=$(qm config "$vmid")
@@ -261,7 +309,6 @@ discover_disk() {
     if [[ "$DISK_PATH" == /dev/zvol/* ]]; then
         BACKEND=zvol
         ZVOL=${DISK_PATH#/dev/zvol/}
-        ZPOOL=${ZVOL%%/*}
         VOLBLK=$(numfmt --from=iec "$(zfs get -H -o value volblocksize "$ZVOL")")
     elif [[ "$DISK_PATH" == *.qcow2 || "$(qemu-img info --output=json "$DISK_PATH" 2>/dev/null | grep -o '"format": "qcow2"')" ]]; then
         BACKEND=qcow2
@@ -285,7 +332,7 @@ attach_disk() {
             PARTX_BASE=$BASE
             ;;
         rawlv)
-            command -v kpartx >/dev/null || die "raw-LV backend needs kpartx (apt install kpartx)."
+            ensure_pkg kpartx kpartx "The raw-LV storage backend"
             BASE=$DISK_PATH
             partx -a "$BASE" >>"$LOGFILE" 2>&1 || true
             PARTX_BASE=$BASE
@@ -343,15 +390,68 @@ _read_part() {
     LAST_FS=$(blkid -o value -s TYPE "$LAST_DEV" 2>/dev/null || echo "")
 }
 
+# A filesystem this tool can shrink in place.
+fs_shrinkable() { case "$1" in ext2|ext3|ext4|ntfs|LVM2_member) return 0 ;; *) return 1 ;; esac; }
+
+# Human note for a partition filesystem in the chooser menu.
+fs_note() {
+    case "$1" in
+        ext2|ext3|ext4)  echo "ext" ;;
+        ntfs)            echo "NTFS" ;;
+        LVM2_member)     echo "LVM" ;;
+        swap)            echo "swap (not shrinkable)" ;;
+        vfat)            echo "FAT/ESP (not shrinkable)" ;;
+        xfs)             echo "XFS (cannot shrink)" ;;
+        BitLocker)       echo "BitLocker (encrypted, cannot shrink)" ;;
+        "")              echo "no filesystem (reserved)" ;;
+        *)               echo "$1 (not shrinkable)" ;;
+    esac
+}
+
+# Explain how to shrink a BitLocker-encrypted volume (only Windows can do it), shown
+# instead of a bare refusal because the encrypted C: is usually what the user wants.
+bitlocker_note() {
+    [[ -t 1 || -t 2 ]] || return 0
+    d_msg "BitLocker encrypted volume" "This partition is BitLocker-encrypted, so it cannot be shrunk offline from the host. Two ways to do it:\n\n A) Shrink it in Windows: Disk Management (\"Shrink Volume\") is BitLocker-aware. Then re-run this tool to reclaim the freed space at the device level (move any trailing partition down and shrink the disk).\n\n B) Turn BitLocker off in Windows first (manage-bde -off <drive>, wait until decryption finishes). The volume is then plain NTFS and this tool can shrink it directly. Re-enable BitLocker afterwards if you want.\n\nCaution is advised: make a backup before either way." 22 78
+}
+
+# Fill ALL_PARTS with one line per GPT partition: "num<TAB>start<TAB>end<TAB>fs".
+scan_parts() {
+    ALL_PARTS=()
+    local n s e d fs
+    while read -r n s e; do
+        [[ "$n" =~ ^[0-9]+$ ]] || continue
+        d=$(partdev "$n"); fs=$(blkid -o value -s TYPE "$d" 2>/dev/null || echo "")
+        ALL_PARTS+=("$n"$'\t'"$s"$'\t'"$e"$'\t'"$fs")
+    done < <(sgdisk -p "$BASE" 2>/dev/null | awk '/^ *[0-9]+ /{print $1, $2, $3}')
+}
+
+# Set the partition to shrink and compute the trailing partitions (those that start
+# after it), ascending by start. Sets LAST_* (via _read_part), GUEST_LVM and TRAIL
+# (array of "num:start:end:fs").
+choose_partition() {
+    _read_part "$1"
+    [[ "$LAST_FS" == LVM2_member ]] && GUEST_LVM=1 || GUEST_LVM=0
+    TRAIL=()
+    local line n s e fs
+    for line in "${ALL_PARTS[@]}"; do
+        IFS=$'\t' read -r n s e fs <<<"$line"
+        (( s > LAST_START )) && TRAIL+=("$n:$s:$e:$fs")
+    done
+    ((${#TRAIL[@]})) && mapfile -t TRAIL < <(printf '%s\n' "${TRAIL[@]}" | sort -t: -k2 -n)
+    log "choose_partition n=$LAST_N fs=$LAST_FS trailing=${TRAIL[*]:-none}"
+}
+
 # ---------------------------------------------------------------------------
 # 4. Analyze partition layout
 # ---------------------------------------------------------------------------
-# Sets: LAST_N LAST_START LAST_END LAST_TYPE LAST_GUID LAST_NAME LAST_FS
-#       LAST_DEV SECTORS SECTOR_SIZE SWAP_N SWAP_UUID GUEST_LVM(0/1)
+# Sets: SECTORS SECTOR_SIZE NO_GPT GUEST_LVM ALL_PARTS, and (via choose_partition on the
+#       default target) LAST_N LAST_START LAST_END LAST_TYPE LAST_GUID LAST_NAME LAST_FS
+#       LAST_DEV TRAIL.
 analyze() {
     SECTOR_SIZE=$(blockdev --getss "$BASE")
     SECTORS=$(blockdev --getsz "$BASE")
-    NO_GPT=0; SWAP_N=""; SWAP_UUID=""; GUEST_LVM=0
+    NO_GPT=0; GUEST_LVM=0; ALL_PARTS=(); TRAIL=()
 
     # Whole-disk case: a filesystem or LVM PV sits directly on the device, no
     # partition table. Common for secondary data disks. Detect and handle without
@@ -368,25 +468,22 @@ analyze() {
     fi
     [[ "$pttype" == gpt || -z "$pttype" ]] || die "Disk $BASE has a $pttype partition table; only GPT and whole-disk are supported."
 
-    # GPT case: the shrinkable partition is the physically last one (greatest end
-    # sector), because a shrink only frees space at the end of the disk.
-    local n
-    n=$(_last_by_end)
-    [[ -n "$n" ]] || die "No GPT partitions and no whole-disk filesystem found on $BASE."
-    _read_part "$n"
-
-    # If the physically last partition is swap, shrink the one below it and recreate
-    # the swap right after the new end.
-    if [[ "$LAST_FS" == swap ]]; then
-        SWAP_N=$LAST_N
-        SWAP_UUID=$(blkid -o value -s UUID "$LAST_DEV" 2>/dev/null || echo "")
-        n=$(_last_by_end "$SWAP_N")
-        [[ -n "$n" ]] || die "Swap is the only data partition; nothing to shrink."
-        _read_part "$n"
+    # GPT case: scan all partitions and default to the largest shrinkable one. The user
+    # can override this in select_partition.
+    scan_parts
+    [[ ${#ALL_PARTS[@]} -gt 0 ]] || die "No GPT partitions and no whole-disk filesystem found on $BASE."
+    local line n s e fs best="" bestsz=0
+    for line in "${ALL_PARTS[@]}"; do
+        IFS=$'\t' read -r n s e fs <<<"$line"
+        fs_shrinkable "$fs" || continue
+        if (( e - s > bestsz )); then bestsz=$((e - s)); best=$n; fi
+    done
+    if [[ -z "$best" ]]; then
+        for line in "${ALL_PARTS[@]}"; do IFS=$'\t' read -r n s e fs <<<"$line"; [[ "$fs" == BitLocker ]] && { bitlocker_note; break; }; done
+        die "No shrinkable filesystem found on $BASE (found: $(for l in "${ALL_PARTS[@]}"; do IFS=$'\t' read -r _ _ _ f <<<"$l"; printf '%s ' "${f:-none}"; done))."
     fi
-
-    [[ "$LAST_FS" == LVM2_member ]] && GUEST_LVM=1
-    log "analyze last_n=$LAST_N fs=$LAST_FS start=$LAST_START end=$LAST_END swap_n=${SWAP_N:-none} lvm=$GUEST_LVM"
+    choose_partition "$best"
+    log "analyze default_n=$LAST_N fs=$LAST_FS start=$LAST_START end=$LAST_END lvm=$GUEST_LVM parts=${#ALL_PARTS[@]}"
 }
 
 # Make sure the target filesystem is clean before touching it. A read-only check
@@ -416,11 +513,11 @@ ensure_clean_fs() {
 # ---------------------------------------------------------------------------
 # 5. Compute minimum data size and safe target
 # ---------------------------------------------------------------------------
-# Reads the ext4 minimum for the shrink target (plain ext4 partition or the guest
-# root LV). Sets: MIN_FS_BYTES (data floor), FS_TARGET_DEV (what resize2fs runs on),
-# GUEST_ROOT_LV / GUEST_PV (when guest LVM).
+# Determines the minimum size of the chosen filesystem (ext via resize2fs -P, NTFS via
+# ntfsresize --info) and sets MIN_FS_BYTES (data floor), FS_TARGET_DEV (what to resize)
+# and GUEST_PV (when guest LVM).
 compute_min() {
-    GUEST_ROOT_LV=""; GUEST_PV=""
+    GUEST_PV=""
     if [[ $GUEST_LVM -eq 1 ]]; then
         GUEST_PV=$LAST_DEV
         # The host LVM global_filter often rejects zvols (/dev/zd*). Scope every LVM
@@ -443,25 +540,45 @@ compute_min() {
         FS_TARGET_DEV=$best_dev
     else
         case "$LAST_FS" in
-            ext2|ext3|ext4) FS_TARGET_DEV=$LAST_DEV ;;
-            xfs)  die "Last partition is XFS and cannot be shrunk." ;;
-            "")   die "Could not detect a filesystem on $LAST_DEV." ;;
-            *)    die "Unsupported filesystem '$LAST_FS' on $LAST_DEV (only ext2/3/4 and guest LVM are supported)." ;;
+            ext2|ext3|ext4|ntfs) FS_TARGET_DEV=$LAST_DEV ;;
+            xfs)        die "Partition $LAST_DEV is XFS and cannot be shrunk." ;;
+            BitLocker)  bitlocker_note; die "BitLocker volume on $LAST_DEV not shrunk (encrypted; see the note)." ;;
+            "")         die "Could not detect a filesystem on $LAST_DEV." ;;
+            *)          die "Unsupported filesystem '$LAST_FS' on $LAST_DEV (supported: ext2/3/4, NTFS, guest LVM)." ;;
         esac
     fi
 
-    ensure_clean_fs "$FS_TARGET_DEV"
-    local minblk blksz
-    minblk=$(resize2fs -P "$FS_TARGET_DEV" 2>/dev/null | awk -F': ' '/Estimated minimum size/{print $2}')
-    blksz=$(dumpe2fs -h "$FS_TARGET_DEV" 2>/dev/null | awk -F': *' '/Block size/{print $2}')
-    [[ -n "$minblk" && -n "$blksz" ]] || die "Could not estimate the minimum filesystem size."
-    MIN_FS_BYTES=$(( minblk * blksz ))
-    log "compute_min target=$FS_TARGET_DEV min_fs_bytes=$MIN_FS_BYTES ($(human "$MIN_FS_BYTES"))"
+    if [[ "$LAST_FS" == ntfs && $GUEST_LVM -eq 0 ]]; then
+        ntfs_prepare "$FS_TARGET_DEV"        # dep check + clean-state guard + MIN_FS_BYTES
+    else
+        ensure_clean_fs "$FS_TARGET_DEV"
+        local minblk blksz
+        minblk=$(resize2fs -P "$FS_TARGET_DEV" 2>/dev/null | awk -F': ' '/Estimated minimum size/{print $2}')
+        blksz=$(dumpe2fs -h "$FS_TARGET_DEV" 2>/dev/null | awk -F': *' '/Block size/{print $2}')
+        [[ -n "$minblk" && -n "$blksz" ]] || die "Could not estimate the minimum filesystem size."
+        MIN_FS_BYTES=$(( minblk * blksz ))
+    fi
+    log "compute_min target=$FS_TARGET_DEV fs=$LAST_FS min_fs_bytes=$MIN_FS_BYTES ($(human "$MIN_FS_BYTES"))"
+}
+
+# NTFS: ensure ntfsresize is available and the volume is cleanly shut down, and set
+# MIN_FS_BYTES from ntfsresize --info.
+ntfs_prepare() {
+    local dev=$1
+    ensure_pkg ntfsresize ntfs-3g "Shrinking NTFS"
+    local info; info=$(ntfsresize --info --force "$dev" 2>&1); echo "$info" >>"$LOGFILE"
+    if grep -qiE 'hibernat|scheduled|is dirty|refused to mount|read-only|please boot|chkdsk' <<<"$info"; then
+        die "The NTFS volume on $dev is not cleanly shut down (hibernation / fast startup / pending check). Boot Windows, disable Fast Startup, shut down fully, then retry."
+    fi
+    local minb
+    minb=$(grep -iE 'might resize at' <<<"$info" | grep -oE '[0-9]+' | head -1)
+    [[ -n "$minb" ]] || die "Could not read the NTFS minimum size from ntfsresize (see $LOGFILE)."
+    MIN_FS_BYTES=$minb
 }
 
 # Given a chosen filesystem size (bytes), compute the resulting device size (bytes),
 # honouring partition start offset, trailing swap, GPT reserve, alignment and backend
-# granularity. Sets: NEW_FS_BYTES NEW_PART_SECTORS NEW_LAST_END NEW_DEV_BYTES SWAP_BYTES
+# granularity. Sets: NEW_FS_BYTES NEW_LAST_END NEW_DEV_BYTES TRAIL_NEW PV_TARGET_BYTES
 plan_sizes() {
     local fs_bytes=$1
     NEW_FS_BYTES=$(roundup "$fs_bytes" "$MIB")
@@ -473,7 +590,7 @@ plan_sizes() {
         if (( GUEST_LVM == 1 )); then dev=$(( NEW_FS_BYTES + 40*MIB )); PV_TARGET_BYTES=$dev; fi
         dev=$(roundup "$dev" "$MIB")
         [[ "$BACKEND" == zvol ]] && dev=$(roundup "$dev" "$VOLBLK")
-        NEW_DEV_BYTES=$dev; NEW_PART_SECTORS=0; NEW_LAST_END=0; SWAP_BYTES=0
+        NEW_DEV_BYTES=$dev; NEW_LAST_END=0; TRAIL_NEW=()
         log "plan_sizes whole-disk fs=$NEW_FS_BYTES dev=$NEW_DEV_BYTES pv=$PV_TARGET_BYTES"
         return 0
     fi
@@ -487,25 +604,29 @@ plan_sizes() {
     local align_sec=$(( MIB / SECTOR_SIZE ))
     NEW_LAST_END=$(( LAST_START + NEW_PART_SECTORS - 1 ))
     NEW_LAST_END=$(( ( (NEW_LAST_END + align_sec) / align_sec ) * align_sec - 1 ))
-    local end_after=$NEW_LAST_END
-    SWAP_BYTES=0
-    if [[ -n "$SWAP_N" ]]; then
-        local ss se
-        ss=$(sgdisk -i "$SWAP_N" "$BASE" | sed -n 's/First sector: \([0-9]*\).*/\1/p')
-        se=$(sgdisk -i "$SWAP_N" "$BASE" | sed -n 's/Last sector: \([0-9]*\).*/\1/p')
-        SWAP_BYTES=$(( (se - ss + 1) * SECTOR_SIZE ))
-        local swap_sec=$(( (se - ss + 1) ))
-        end_after=$(( NEW_LAST_END + 1 + swap_sec ))
-        end_after=$(( ( (end_after + align_sec) / align_sec ) * align_sec - 1 ))
-    fi
-    # device must hold everything plus GPT backup (33 sectors), rounded up to 1 MiB
-    local dev_bytes=$(( (end_after + 34) * SECTOR_SIZE ))
+    place_trailing
+    log "plan_sizes fs=$NEW_FS_BYTES part_end=$NEW_LAST_END trailing=${TRAIL_NEW[*]:-none} dev=$NEW_DEV_BYTES"
+}
+
+# From the current NEW_LAST_END, place every trailing partition right after the shrunk
+# one (order and size kept) and size the device. Sets TRAIL_NEW (num:oldstart:oldend:
+# newstart:newend:fs) and NEW_DEV_BYTES.
+place_trailing() {
+    local align_sec=$(( MIB / SECTOR_SIZE )) end_after=$NEW_LAST_END t num os oe fs sz ns ne
+    TRAIL_NEW=()
+    for t in "${TRAIL[@]:-}"; do
+        [[ -n "$t" ]] || continue
+        IFS=: read -r num os oe fs <<<"$t"
+        sz=$(( oe - os + 1 ))
+        ns=$(( ( (end_after / align_sec) + 1 ) * align_sec ))   # next 1 MiB boundary after prev
+        ne=$(( ns + sz - 1 ))
+        TRAIL_NEW+=("$num:$os:$oe:$ns:$ne:$fs")
+        end_after=$ne
+    done
+    local dev_bytes=$(( (end_after + 34) * SECTOR_SIZE ))     # + GPT backup
     dev_bytes=$(roundup "$dev_bytes" "$MIB")
-    if [[ "$BACKEND" == zvol ]]; then
-        dev_bytes=$(roundup "$dev_bytes" "$VOLBLK")
-    fi
+    [[ "$BACKEND" == zvol ]] && dev_bytes=$(roundup "$dev_bytes" "$VOLBLK")
     NEW_DEV_BYTES=$dev_bytes
-    log "plan_sizes fs=$NEW_FS_BYTES part_end=$NEW_LAST_END dev=$NEW_DEV_BYTES swap=$SWAP_BYTES"
 }
 
 # ---------------------------------------------------------------------------
@@ -546,7 +667,6 @@ ask_target() {
 do_shrink() {
     local vmid=$1
     # 7.1 shrink filesystem
-    local fs_sectors_4k=$(( NEW_FS_BYTES / 4096 ))
     if [[ $GUEST_LVM -eq 1 ]]; then
         log "lvreduce --resizefs -L ${NEW_FS_BYTES}B $FS_TARGET_DEV"
         ( lvreduce "${LVM_CFG[@]}" --resizefs -f -L "${NEW_FS_BYTES}B" "$FS_TARGET_DEV" >>"$LOGFILE" 2>&1 ) &
@@ -574,14 +694,16 @@ do_shrink() {
             [[ "$BACKEND" == zvol ]] && d=$(roundup "$d" "$VOLBLK")
             NEW_DEV_BYTES=$d
         else
-            NEW_PART_SECTORS=$(( (PV_TARGET_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE ))
-            NEW_LAST_END=$(( LAST_START + NEW_PART_SECTORS - 1 ))
+            local psec=$(( (PV_TARGET_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE ))
+            NEW_LAST_END=$(( LAST_START + psec - 1 ))
             NEW_LAST_END=$(( ( (NEW_LAST_END + align2) / align2 ) * align2 - 1 ))
-            local db=$(( (NEW_LAST_END + 34) * SECTOR_SIZE ))
-            db=$(roundup "$db" "$MIB"); [[ "$BACKEND" == zvol ]] && db=$(roundup "$db" "$VOLBLK")
-            NEW_DEV_BYTES=$db
+            place_trailing
         fi
         log "lvm recomputed part_end=${NEW_LAST_END:-na} dev=$NEW_DEV_BYTES"
+    elif [[ "$LAST_FS" == ntfs ]]; then
+        log "ntfsresize --size ${NEW_FS_BYTES} $FS_TARGET_DEV"
+        ( printf 'y\n' | ntfsresize --force --size "${NEW_FS_BYTES}" "$FS_TARGET_DEV" >>"$LOGFILE" 2>&1 ) &
+        gauge_wait $! 15 50 "Shrinking NTFS filesystem" || die "ntfsresize failed. See $LOGFILE"
     else
         log "resize2fs $FS_TARGET_DEV ${NEW_FS_BYTES} bytes"
         ( resize2fs "$FS_TARGET_DEV" "$(( NEW_FS_BYTES / 4096 ))" >>"$LOGFILE" 2>&1 ) &
@@ -590,27 +712,57 @@ do_shrink() {
 
     # 7.2 / 7.3 partition work only applies to partitioned (GPT) disks
     if [[ ${NO_GPT:-0} -eq 0 ]]; then
-        progress 55 "Shrinking partition"
-        # recreate the last (data) partition smaller, preserving identity
-        local align_sec=$(( MIB / SECTOR_SIZE ))
+        # capture trailing swap UUIDs now, while the original partition mapping is intact
+        declare -A SWAP_UUIDS=()
+        local te tn tf
+        for te in "${TRAIL_NEW[@]:-}"; do
+            [[ -n "$te" ]] || continue
+            IFS=: read -r tn _ _ _ _ tf <<<"$te"
+            [[ "$tf" == swap ]] && SWAP_UUIDS[$tn]=$(blkid -o value -s UUID "$(partdev "$tn")" 2>/dev/null || echo "")
+        done
+
+        progress 55 "Shrinking partition $LAST_N"
+        # shrink the chosen partition: start unchanged, new smaller end, identity kept
         sgdisk -d "$LAST_N" "$BASE" >>"$LOGFILE" 2>&1
         sgdisk -n "${LAST_N}:${LAST_START}:${NEW_LAST_END}" \
                -t "${LAST_N}:${LAST_TYPE}" -u "${LAST_N}:${LAST_GUID}" \
                ${LAST_NAME:+-c "${LAST_N}:${LAST_NAME}"} "$BASE" >>"$LOGFILE" 2>&1 \
             || die "Recreating partition $LAST_N failed. The original layout is in $LOGFILE."
 
-        # recreate trailing swap right after the new data partition
-        if [[ -n "$SWAP_N" ]]; then
-            local swap_start=$(( ( (NEW_LAST_END + 1 + align_sec) / align_sec ) * align_sec ))
-            local swap_sectors=$(( SWAP_BYTES / SECTOR_SIZE ))
-            local swap_end=$(( swap_start + swap_sectors - 1 ))
-            sgdisk -d "$SWAP_N" "$BASE" >>"$LOGFILE" 2>&1 || true
-            sgdisk -n "${SWAP_N}:${swap_start}:${swap_end}" -t "${SWAP_N}:8200" "$BASE" >>"$LOGFILE" 2>&1
-            partx -u "$BASE" >>"$LOGFILE" 2>&1 || true; udevadm settle 2>/dev/null || true; sleep 1
-            progress 60 "Recreating swap"
-            local swapdev; swapdev=$(partdev "$SWAP_N")
-            mkswap ${SWAP_UUID:+-U "$SWAP_UUID"} "$swapdev" >>"$LOGFILE" 2>&1 || die "mkswap failed on $swapdev."
-        fi
+        # move every trailing partition down into the freed space, keeping order and
+        # identity. Data partitions are relocated block-for-block; swap is recreated.
+        local e num os oe ns ne fs info tguid tuniq tname cnt suuid pct=57
+        for e in "${TRAIL_NEW[@]:-}"; do
+            [[ -n "$e" ]] || continue
+            IFS=: read -r num os oe ns ne fs <<<"$e"
+            info=$(sgdisk -i "$num" "$BASE")
+            tguid=$(sed -n 's/Partition GUID code: \([0-9A-Fa-f-]*\).*/\1/p' <<<"$info")
+            tuniq=$(sed -n 's/Partition unique GUID: \([0-9A-Fa-f-]*\).*/\1/p' <<<"$info")
+            tname=$(sed -n "s/Partition name: '\(.*\)'/\1/p" <<<"$info")
+            if [[ "$fs" == swap ]]; then
+                suuid=${SWAP_UUIDS[$num]:-}
+                sgdisk -d "$num" "$BASE" >>"$LOGFILE" 2>&1
+                sgdisk -n "${num}:${ns}:${ne}" -t "${num}:${tguid}" -u "${num}:${tuniq}" \
+                       ${tname:+-c "${num}:${tname}"} "$BASE" >>"$LOGFILE" 2>&1 || die "Recreating swap $num failed."
+                partx -u "$BASE" >>"$LOGFILE" 2>&1 || true; udevadm settle 2>/dev/null || true; sleep 1
+                progress "$pct" "Recreating swap (part $num)"
+                mkswap ${suuid:+-U "$suuid"} "$(partdev "$num")" >>"$LOGFILE" 2>&1 || die "mkswap failed on part $num."
+            else
+                # relocate raw blocks; moving DOWN with an ascending copy is overlap-safe
+                cnt=$(( oe - os + 1 ))
+                log "move part$num data: sector $os -> $ns ($cnt sectors)"
+                ( dd if="$BASE" of="$BASE" bs=4M conv=notrunc \
+                     iflag=skip_bytes,count_bytes oflag=seek_bytes \
+                     skip=$(( os * SECTOR_SIZE )) seek=$(( ns * SECTOR_SIZE )) count=$(( cnt * SECTOR_SIZE )) \
+                     >>"$LOGFILE" 2>&1 ) &
+                gauge_wait $! "$pct" $((pct+8)) "Moving partition $num" || die "Moving partition $num failed."
+                sgdisk -d "$num" "$BASE" >>"$LOGFILE" 2>&1
+                sgdisk -n "${num}:${ns}:${ne}" -t "${num}:${tguid}" -u "${num}:${tuniq}" \
+                       ${tname:+-c "${num}:${tname}"} "$BASE" >>"$LOGFILE" 2>&1 || die "Recreating moved partition $num failed."
+            fi
+            pct=$((pct+8)); (( pct > 66 )) && pct=66
+        done
+        partx -u "$BASE" >>"$LOGFILE" 2>&1 || true; udevadm settle 2>/dev/null || true; sleep 1
     fi
 
     # 7.4 detach before touching the block device geometry
@@ -721,9 +873,10 @@ main() {
         clear; exit 0
     fi
 
-    # attach + analyze + compute minimum
+    # attach + analyze + choose partition + compute minimum
     attach_disk
     analyze
+    select_partition
     compute_min
 
     # choose target
@@ -739,9 +892,15 @@ main() {
     fi
 
     # summary / confirmation
-    local layout="plain ext4"
-    [[ $GUEST_LVM -eq 1 ]] && layout="guest LVM (VG $ACTIVE_VG)"
-    [[ -n "$SWAP_N" ]] && layout="$layout + trailing swap"
+    local layout
+    if [[ ${NO_GPT:-0} -eq 1 ]]; then
+        layout="whole-disk $LAST_FS (no partition table)"
+    elif [[ $GUEST_LVM -eq 1 ]]; then
+        layout="guest LVM (VG $ACTIVE_VG), partition $LAST_N"
+    else
+        layout="$LAST_FS, partition $LAST_N"
+    fi
+    (( ${#TRAIL_NEW[@]} )) && layout="$layout, ${#TRAIL_NEW[@]} partition(s) after it moved down (order kept)"
     local summary
     summary=$(cat <<EOF
 
@@ -755,7 +914,7 @@ Data in use:     $(human "$MIN_FS_BYTES")
 New filesystem:  $(human "$NEW_FS_BYTES")
 New device size: $(human "$NEW_DEV_BYTES")   (currently $(human $(( SECTORS * SECTOR_SIZE ))))
 
-Steps: fsck -> resize fs -> shrink partition (PARTUUID kept) ->
+Steps: resize filesystem -> shrink partition -> move trailing partitions ->
        shrink $BACKEND -> fix GPT backup -> qm rescan
 EOF
 )
