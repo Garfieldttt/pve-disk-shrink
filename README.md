@@ -130,3 +130,19 @@ exit
 
 All actions, including the original partition layout, are logged to
 `/var/log/pve-disk-shrink/pve-disk-shrink.log`.
+<img width="2113" height="1062" alt="Bildschirmfoto vom 2026-07-18 21-22-01" src="https://github.com/user-attachments/assets/c6004013-7e30-494e-bdbf-910563ce9594" />
+<img width="2113" height="1062" alt="Bildschirmfoto vom 2026-07-18 21-22-14" src="https://github.com/user-attachments/assets/e4ced3db-af0f-441e-8b8f-5bf61e15c644" />
+<img width="2113" height="1062" alt="Bildschirmfoto vom 2026-07-18 21-22-25" src="https://github.com/user-attachments/assets/feadf630-e759-47fc-8b79-86cd71eb19a0" />
+<img width="2113" height="1062" alt="Bildschirmfoto vom 2026-07-18 21-22-37" src="https://github.com/user-attachments/assets/00fd0204-696c-49aa-98cc-a3ad1948b9e0" />
+<img width="2113" height="1062" alt="Bildschirmfoto vom 2026-07-18 21-22-43" src="https://github.com/user-attachments/assets/b9063727-b1aa-49a0-8777-c4bff729c963" />
+<img width="2113" height="1062" alt="Bildschirmfoto vom 2026-07-18 21-23-00" src="https://github.com/user-attachments/assets/203b9969-29b1-4bce-9c61-f1e6341d621b" />
+<img width="1639" height="955" alt="Bildschirmfoto vom 2026-07-18 20-28-59" src="https://github.com/user-attachments/assets/6ee7e2c7-52c7-4c3e-9b36-10bad8aaa54a" />
+
+
+
+
+
+
+
+
+
