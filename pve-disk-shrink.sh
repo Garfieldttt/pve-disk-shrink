@@ -28,7 +28,7 @@ export LC_ALL=C LANG=C
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.2.0"
+VERSION="1.3.0"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -36,6 +36,8 @@ LOGFILE="$LOGDIR/pve-disk-shrink.log"
 BACKTITLE="PVE Disk Shrink v$VERSION"
 
 # State filled in during discovery / execution (used by the cleanup trap)
+GUEST_TYPE="vm"      # vm (qm) or ct (pct / LXC container)
+DATASET=""           # ZFS dataset name for a container subvol volume
 NBD_DEV=""            # /dev/nbdX if a qcow2 image is attached
 PARTX_BASE=""         # base device we ran "partx -a" against
 ACTIVE_VG=""          # guest volume group we activated and must deactivate
@@ -86,7 +88,7 @@ cleanup() {
     fi
     # re-enable the protection flag if we disabled it
     if [[ -n "$PROTECTION_VMID" ]]; then
-        qm set "$PROTECTION_VMID" --protection 1 >>"$LOGFILE" 2>&1 || true
+        guest_setprot "$PROTECTION_VMID" 1 >>"$LOGFILE" 2>&1 || true
         PROTECTION_VMID=""
     fi
     if [[ -n "$ACTIVE_VG" ]]; then
@@ -206,21 +208,37 @@ preflight_env() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Select VM
+# Guest (VM via qm, or LXC container via pct) management dispatch
 # ---------------------------------------------------------------------------
-select_vm() {
-    local args=() line vmid name status
-    while read -r vmid name status _; do
-        [[ "$vmid" =~ ^[0-9]+$ ]] || continue
-        args+=("$vmid" "$name [$status]")
-    done < <(qm list | tail -n +2)
-    [[ ${#args[@]} -gt 0 ]] || die "No VMs found."
-    d_menu "Select VM" "Choose the VM whose disk you want to shrink:" 16 "${args[@]}"
+guest_noun()     { if [[ $GUEST_TYPE == ct ]]; then printf CT; else printf VM; fi; }
+guest_config()   { if [[ $GUEST_TYPE == ct ]]; then pct config "$1"; else qm config "$1"; fi; }
+guest_status()   { if [[ $GUEST_TYPE == ct ]]; then pct status "$1" 2>/dev/null | awk '{print $2}'; else qm status "$1" 2>/dev/null | awk '{print $2}'; fi; }
+guest_stop()     { if [[ $GUEST_TYPE == ct ]]; then pct stop "$1"; else qm stop "$1"; fi; }
+guest_start()    { if [[ $GUEST_TYPE == ct ]]; then pct start "$1"; else qm start "$1"; fi; }
+guest_listsnap() { if [[ $GUEST_TYPE == ct ]]; then pct listsnapshot "$1" 2>/dev/null; else qm listsnapshot "$1" 2>/dev/null; fi; }
+guest_delsnap()  { if [[ $GUEST_TYPE == ct ]]; then pct delsnapshot "$1" "$2"; else qm delsnapshot "$1" "$2"; fi; }
+guest_setprot()  { if [[ $GUEST_TYPE == ct ]]; then pct set "$1" --protection "$2"; else qm set "$1" --protection "$2"; fi; }
+
+# ---------------------------------------------------------------------------
+# 1. Select a VM or container
+# ---------------------------------------------------------------------------
+select_guest() {
+    local args=() id name status
+    while read -r id name status _; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        args+=("$id" "VM  $name [$status]")
+    done < <(qm list 2>/dev/null | tail -n +2)
+    while read -r id status name; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        args+=("$id" "CT  $name [$status]")
+    done < <(pct list 2>/dev/null | awk 'NR>1{print $1, $2, $NF}')
+    [[ ${#args[@]} -gt 0 ]] || die "No VMs or containers found."
+    d_menu "Select VM or container" "Choose the guest whose disk or volume you want to shrink:" 18 "${args[@]}"
 }
 
-# Echo the names of a VM's snapshots, one per line, excluding the "current" marker.
+# Echo the names of a guest's snapshots, one per line, excluding the "current" marker.
 list_snapshots() {
-    qm listsnapshot "$1" 2>/dev/null \
+    guest_listsnap "$1" \
         | sed -E 's/^[^A-Za-z0-9_]*//' \
         | awk 'NF{print $1}' \
         | grep -vx current || true
@@ -256,6 +274,33 @@ select_disk() {
     done < <(list_disks "$vmid")
     [[ ${#args[@]} -gt 0 ]] || die "VM $vmid has no shrinkable data disks."
     d_menu "Select disk on VM $vmid" "A VM can have several disks. Pick the one to shrink.\nefidisk, tpmstate, cloudinit and CD drives are never listed." 12 "${args[@]}"
+}
+
+# Echoes "key<TAB>volume<TAB>size" for a container's rootfs and mount-point volumes.
+# Skips bind mounts and device passthrough (entries with no storage:volume reference).
+ct_list_volumes() {
+    local id=$1 line key rest vol size
+    while IFS= read -r line; do
+        key=${line%%:*}
+        [[ "$key" =~ ^(rootfs|mp[0-9]+)$ ]] || continue
+        rest=${line#*: }
+        vol=${rest%%,*}
+        [[ "$vol" == *:* ]] || continue
+        size=$(sed -n 's/.*size=\([0-9A-Za-z.]*\).*/\1/p' <<<"$rest")
+        printf '%s\t%s\t%s\n' "$key" "$vol" "${size:-?}"
+    done < <(pct config "$id")
+}
+
+# Pick which disk (VM) or volume (container) to shrink, dispatching on guest type.
+select_volume() {
+    local id=$1
+    if [[ $GUEST_TYPE == vm ]]; then select_disk "$id"; return; fi
+    local args=() key vol size
+    while IFS=$'\t' read -r key vol size; do
+        args+=("$key" "$vol  ($size)")
+    done < <(ct_list_volumes "$id")
+    [[ ${#args[@]} -gt 0 ]] || die "Container $id has no shrinkable volumes."
+    d_menu "Select volume on CT $id" "Pick the rootfs or mount-point volume to shrink." 12 "${args[@]}"
 }
 
 # Dialog to pick which partition to shrink. Lists every partition with its size and
@@ -325,6 +370,34 @@ discover_disk() {
     log "discover vmid=$vmid key=$DISK_KEY vol=$DISK_VOL path=$DISK_PATH backend=$BACKEND cfgsize=${CFG_SIZE:-?}"
 }
 
+# Discover the backend for a chosen container volume (rootfs or mpN). Container volumes hold
+# a filesystem directly (no partition table). Sets the same globals as discover_disk plus
+# DATASET for a ZFS subvol. BACKEND is one of: rawfile (raw image on a dir), ctlvm (LV) or
+# zfssubvol (ZFS dataset with a refquota).
+discover_ct() {
+    local id=$1 key=$2 cfg
+    cfg=$(pct config "$id")
+    DISK_KEY=$key
+    DISK_VOL=$(sed -n "s/^${key}: \([^,]*\).*/\1/p" <<<"$cfg")
+    [[ -n "$DISK_VOL" ]] || die "Could not read volume for $key."
+    CFG_SIZE=$(sed -n "s/^${key}:.*size=\([0-9A-Za-z.]*\).*/\1/p" <<<"$cfg")
+    DISK_PATH=$(pvesm path "$DISK_VOL")
+    [[ -n "$DISK_PATH" ]] || die "pvesm path failed for $DISK_VOL."
+    local volname=${DISK_VOL#*:}
+    if [[ "$volname" == subvol-* || -d "$DISK_PATH" ]]; then
+        BACKEND=zfssubvol
+        DATASET=$(zfs list -H -o name,mountpoint -t filesystem 2>/dev/null | awk -v m="$DISK_PATH" '$2==m{print $1}')
+        [[ -n "$DATASET" ]] || die "Could not resolve the ZFS dataset for $DISK_VOL (path $DISK_PATH)."
+    elif [[ -b "$DISK_PATH" ]]; then
+        BACKEND=ctlvm
+    elif [[ -f "$DISK_PATH" ]]; then
+        BACKEND=rawfile
+    else
+        die "Unsupported container volume path: $DISK_PATH"
+    fi
+    log "discover ct id=$id key=$key vol=$DISK_VOL path=$DISK_PATH backend=$BACKEND dataset=${DATASET:-none} cfgsize=${CFG_SIZE:-?}"
+}
+
 # ---------------------------------------------------------------------------
 # 3. Attach / detach the disk as a block device with partition children
 # ---------------------------------------------------------------------------
@@ -341,6 +414,10 @@ attach_disk() {
             BASE=$DISK_PATH
             partx -a "$BASE" >>"$LOGFILE" 2>&1 || true
             PARTX_BASE=$BASE
+            ;;
+        rawfile|ctlvm)
+            # Container volume: a filesystem sits directly on the file/LV, no partition table.
+            BASE=$DISK_PATH
             ;;
         qcow2)
             modprobe nbd max_part=16 2>>"$LOGFILE" || true
@@ -483,8 +560,14 @@ choose_partition() {
 #       default target) LAST_N LAST_START LAST_END LAST_TYPE LAST_GUID LAST_NAME LAST_FS
 #       LAST_DEV TRAIL.
 analyze() {
-    SECTOR_SIZE=$(blockdev --getss "$BASE")
-    SECTORS=$(blockdev --getsz "$BASE")
+    if [[ -b "$BASE" ]]; then
+        SECTOR_SIZE=$(blockdev --getss "$BASE")
+        SECTORS=$(blockdev --getsz "$BASE")
+    else
+        # container raw image file: no block device, size comes from the file itself
+        SECTOR_SIZE=512
+        SECTORS=$(( $(stat -c%s "$BASE") / 512 ))
+    fi
     NO_GPT=0; GUEST_LVM=0; ALL_PARTS=(); TRAIL=(); TRAILING_ONLY=0; LVM_COMPACT=0
 
     # Whole-disk case: a filesystem or LVM PV sits directly on the device, no
@@ -965,6 +1048,24 @@ do_shrink() {
             ( qemu-img resize --shrink "$DISK_PATH" "${NEW_DEV_BYTES}" >>"$LOGFILE" 2>&1 ) &
             gauge_wait $! 70 90 "Shrinking $BACKEND image" || die "qemu-img resize failed."
             ;;
+        rawfile)
+            log "qemu-img resize --shrink -f raw $DISK_PATH ${NEW_DEV_BYTES}"
+            ( qemu-img resize --shrink -f raw "$DISK_PATH" "${NEW_DEV_BYTES}" >>"$LOGFILE" 2>&1 ) &
+            gauge_wait $! 70 90 "Shrinking image file" || die "qemu-img resize failed."
+            ;;
+        ctlvm)
+            # lvreduce rounds to whole extents; round the target UP to the extent size so the
+            # logical volume can never end up smaller than the filesystem just resized into it.
+            local ctvg ctext ctdev
+            ctvg=$(lvs --noheadings -o vg_name "$DISK_PATH" 2>>"$LOGFILE" | tr -d ' ')
+            ctext=$(vgs --noheadings --units b --nosuffix -o vg_extent_size "$ctvg" 2>>"$LOGFILE" | tr -d ' ')
+            [[ "$ctext" =~ ^[0-9]+$ ]] || ctext=$(( 4 * MIB ))
+            ctdev=$(( (NEW_DEV_BYTES + ctext - 1) / ctext * ctext ))
+            log "lvreduce -f -L ${ctdev}b $DISK_PATH (vg=$ctvg extent=$ctext)"
+            ( lvreduce -f -L "${ctdev}b" "$DISK_PATH" >>"$LOGFILE" 2>&1 ) &
+            gauge_wait $! 70 90 "Shrinking logical volume" || die "lvreduce failed."
+            NEW_DEV_BYTES=$ctdev
+            ;;
     esac
 
     # 7.6 move the GPT backup header to the new end and verify (GPT disks only)
@@ -992,10 +1093,78 @@ do_shrink() {
         [[ -n "$NBD_DEV" ]] && { qemu-nbd -d "$NBD_DEV" >>"$LOGFILE" 2>&1 || true; NBD_DEV=""; }
     fi
 
-    # 7.7 sync the VM config
-    progress 97 "Updating VM config"
-    qm rescan --vmid "$vmid" >>"$LOGFILE" 2>&1 || true
-    log "shrink complete vmid=$vmid new_dev=$NEW_DEV_BYTES"
+    # 7.7 sync the guest config
+    progress 97 "Updating $(guest_noun) config"
+    if [[ $GUEST_TYPE == ct ]]; then
+        ct_set_size "$vmid" "$DISK_KEY" "$NEW_DEV_BYTES"
+    else
+        qm rescan --vmid "$vmid" >>"$LOGFILE" 2>&1 || true
+    fi
+    log "shrink complete $GUEST_TYPE=$vmid new_dev=$NEW_DEV_BYTES"
+}
+
+# Write the new size (MiB) into a container volume's line in /etc/pve/lxc/<id>.conf.
+# pct resize only grows, so the config is edited directly after an offline shrink.
+ct_set_size() {
+    local id=$1 key=$2 bytes=$3
+    local conf="/etc/pve/lxc/${id}.conf"
+    local mib=$(( bytes / MIB ))
+    log "ct_set_size $conf $key -> ${mib}M"
+    sed -i -E "/^${key}: /{ s/(,size=)[0-9A-Za-z.]+/\\1${mib}M/ }" "$conf" 2>>"$LOGFILE" \
+        || log "warning: could not update size for $key in $conf"
+}
+
+# Shrink a container whose volume is a ZFS subvol by lowering the dataset refquota to the
+# referenced data plus a chosen headroom. No filesystem or block device is touched, which
+# makes it safe, filesystem agnostic and reversible. Self-contained (own confirm/execute).
+ct_subvol_shrink() {
+    local id=$1 referenced curq curb new
+    referenced=$(zfs get -Hp -o value referenced "$DATASET" 2>>"$LOGFILE")
+    [[ "$referenced" =~ ^[0-9]+$ ]] || die "Could not read the referenced size of $DATASET."
+    MIN_FS_BYTES=$referenced
+    curq=$(zfs get -H -o value refquota "$DATASET" 2>>"$LOGFILE")          # human, or "none"
+    ask_target || { clear; exit 0; }                                      # CHOSEN_FS_BYTES >= referenced
+    new=$(roundup "$CHOSEN_FS_BYTES" "$MIB")
+    curb=$(zfs get -Hp -o value refquota "$DATASET" 2>/dev/null)
+    [[ "$curb" =~ ^[0-9]+$ ]] || curb=0                                    # none -> unlimited
+    if (( curb > 0 && new >= curb )); then
+        d_msg "Nothing to do" "The new refquota ($(human "$new")) is not smaller than the current one ($(human "$curb")). No changes made."
+        clear; exit 0
+    fi
+    local summary
+    summary=$(cat <<EOF
+
+CT:              $id
+Volume:          $DISK_KEY  ($DISK_VOL)
+Scheme:          Linux container on ZFS (subvol)
+Dataset:         $DATASET
+Mode:            lower the dataset refquota (no filesystem is touched)
+
+Data referenced:  $(human "$referenced")
+Current refquota: $([[ "$curq" == none ]] && echo "unlimited" || echo "$curq")
+New refquota:     $(human "$new")
+
+Steps: zfs set refquota -> update CT config
+EOF
+)
+    if [[ $DRY_RUN -eq 1 ]]; then
+        d_msg "Dry run (no changes made)" "$summary" 20 78
+        clear; printf 'Dry run complete. Plan written to %s\n' "$LOGFILE"; exit 0
+    fi
+    if ! d_yesno "Confirm shrink" "$summary\n\nProceed?" 22 78; then clear; exit 0; fi
+    start_gauge; progress 40 "Setting refquota"
+    zfs set refquota="${new}" "$DATASET" >>"$LOGFILE" 2>&1 || die "zfs set refquota failed. See $LOGFILE."
+    progress 97 "Updating CT config"
+    ct_set_size "$id" "$DISK_KEY" "$new"
+    stop_gauge
+    log "subvol shrink ct=$id dataset=$DATASET refquota=$new"
+    local msg="Shrink complete.\n\nNew refquota: $(human "$new")\nDataset: $DATASET\nLog: $LOGFILE"
+    if d_yesno "Done - start CT?" "$msg\n\nStart CT $id now?"; then
+        guest_start "$id" >>"$LOGFILE" 2>&1 || die "Starting CT $id failed. Check the console."
+        msg="$msg\n\nCT started."
+    fi
+    clear
+    printf '%b\n' "$msg"
 }
 
 # ---------------------------------------------------------------------------
@@ -1013,16 +1182,18 @@ main() {
 
     preflight_env
 
-    local vmid; vmid=$(select_vm) || { clear; exit 0; }
-    local diskkey; diskkey=$(select_disk "$vmid") || { clear; exit 0; }
-    discover_disk "$vmid" "$diskkey"
+    local vmid; vmid=$(select_guest) || { clear; exit 0; }
+    if pct config "$vmid" >/dev/null 2>&1; then GUEST_TYPE=ct; else GUEST_TYPE=vm; fi
+    local noun; noun=$(guest_noun)
+    local diskkey; diskkey=$(select_volume "$vmid") || { clear; exit 0; }
+    if [[ $GUEST_TYPE == ct ]]; then discover_ct "$vmid" "$diskkey"; else discover_disk "$vmid" "$diskkey"; fi
 
     # preflight: state, snapshots, protection, backup hint
-    local status; status=$(qm status "$vmid" | awk '{print $2}')
+    local status; status=$(guest_status "$vmid")
     if [[ "$status" != stopped ]]; then
-        if d_yesno "VM is running" "VM $vmid is $status.\n\nThe disk must be offline to shrink it safely. Stop the VM now?"; then
-            qm stop "$vmid" >>"$LOGFILE" 2>&1 || die "qm stop failed."
-            for _ in $(seq 1 30); do [[ "$(qm status "$vmid" | awk '{print $2}')" == stopped ]] && break; sleep 1; done
+        if d_yesno "$noun is running" "$noun $vmid is $status.\n\nThe volume must be offline to shrink it safely. Stop it now?"; then
+            guest_stop "$vmid" >>"$LOGFILE" 2>&1 || die "Stopping $noun $vmid failed."
+            for _ in $(seq 1 30); do [[ "$(guest_status "$vmid")" == stopped ]] && break; sleep 1; done
         else
             clear; exit 0
         fi
@@ -1031,30 +1202,37 @@ main() {
     snapnames=$(list_snapshots "$vmid")
     if [[ -n "$snapnames" ]]; then
         cnt=$(grep -c . <<<"$snapnames")
-        if d_yesno "Snapshots present" "VM $vmid has $cnt snapshot(s):\n\n$snapnames\n\nSnapshots block a disk shrink and cannot be kept. If you continue, ALL of these snapshots will be DELETED PERMANENTLY (this cannot be undone).\n\nDelete all snapshots and continue?" 20 74; then
+        if d_yesno "Snapshots present" "$noun $vmid has $cnt snapshot(s):\n\n$snapnames\n\nSnapshots block a shrink and cannot be kept. If you continue, ALL of these snapshots will be DELETED PERMANENTLY (this cannot be undone).\n\nDelete all snapshots and continue?" 20 74; then
             # delete leaf-first (reverse of the listed root->child order)
             local s
             while read -r s; do
                 [[ -n "$s" ]] || continue
-                qm delsnapshot "$vmid" "$s" >>"$LOGFILE" 2>&1 || die "Failed to delete snapshot '$s'. Aborting; no shrink performed."
+                guest_delsnap "$vmid" "$s" >>"$LOGFILE" 2>&1 || die "Failed to delete snapshot '$s'. Aborting; no shrink performed."
             done < <(tac <<<"$snapnames")
             [[ -z "$(list_snapshots "$vmid")" ]] || die "Snapshots still present after deletion. Aborting."
-            log "deleted $cnt snapshots on vmid=$vmid"
+            log "deleted $cnt snapshots on $GUEST_TYPE=$vmid"
         else
             clear; exit 0
         fi
     fi
-    if grep -q '^protection: 1' <(qm config "$vmid"); then
-        if d_yesno "Protection enabled" "VM $vmid has protection=1.\n\nDisable it for the shrink and re-enable it automatically at the end (also on cancel or error)?"; then
-            qm set "$vmid" --protection 0 >>"$LOGFILE" 2>&1 || die "Could not disable protection."
+    if grep -q '^protection: 1' <(guest_config "$vmid"); then
+        if d_yesno "Protection enabled" "$noun $vmid has protection=1.\n\nDisable it for the shrink and re-enable it automatically at the end (also on cancel or error)?"; then
+            guest_setprot "$vmid" 0 >>"$LOGFILE" 2>&1 || die "Could not disable protection."
             PROTECTION_VMID=$vmid
         else
             d_msg "Protection kept" "Protection stays enabled. If a step is blocked by it, re-run and allow disabling."
         fi
     fi
 
-    if ! d_yesno "Backup reminder" "This tool does NOT create any backup.\n\nMake sure a current backup (PBS) of VM $vmid exists before continuing.\n\nContinue?"; then
+    if ! d_yesno "Backup reminder" "This tool does NOT create any backup.\n\nMake sure a current backup of $noun $vmid exists before continuing.\n\nContinue?"; then
         clear; exit 0
+    fi
+
+    # ZFS subvol containers shrink by lowering the dataset refquota; no block or filesystem
+    # work, so they take a dedicated path.
+    if [[ "$BACKEND" == zfssubvol ]]; then
+        ct_subvol_shrink "$vmid"
+        return
     fi
 
     # attach + analyze + choose partition
@@ -1115,8 +1293,8 @@ main() {
     if [[ ${TRAILING_ONLY:-0} -eq 1 ]]; then
         summary=$(cat <<EOF
 
-VM:              $vmid
-Disk:            $DISK_KEY  ($DISK_VOL)
+${noun}:              $vmid
+Volume:          $DISK_KEY  ($DISK_VOL)
 Scheme:          $scheme
 Backend:         $BACKEND
 Layout:          $layout
@@ -1131,8 +1309,8 @@ EOF
     elif [[ ${LVM_COMPACT:-0} -eq 1 ]]; then
         summary=$(cat <<EOF
 
-VM:              $vmid
-Disk:            $DISK_KEY  ($DISK_VOL)
+${noun}:              $vmid
+Volume:          $DISK_KEY  ($DISK_VOL)
 Scheme:          $scheme
 Backend:         $BACKEND
 Layout:          $layout
@@ -1145,10 +1323,16 @@ Steps: compact PV -> shrink partition $LAST_N -> shrink $BACKEND -> fix GPT back
 EOF
 )
     else
+        local steps
+        if [[ ${NO_GPT:-0} -eq 1 ]]; then
+            steps="resize filesystem -> shrink $BACKEND -> update $noun config"
+        else
+            steps="resize filesystem -> shrink partition -> move trailing partitions -> shrink $BACKEND -> fix GPT backup -> qm rescan"
+        fi
         summary=$(cat <<EOF
 
-VM:              $vmid
-Disk:            $DISK_KEY  ($DISK_VOL)
+${noun}:              $vmid
+Volume:          $DISK_KEY  ($DISK_VOL)
 Scheme:          $scheme
 Backend:         $BACKEND
 Layout:          $layout
@@ -1157,8 +1341,7 @@ Data in use:     $(human "$MIN_FS_BYTES")
 New filesystem:  $(human "$NEW_FS_BYTES")
 New device size: $(human "$NEW_DEV_BYTES")   (currently $(human $(( SECTORS * SECTOR_SIZE ))))
 
-Steps: resize filesystem -> shrink partition -> move trailing partitions ->
-       shrink $BACKEND -> fix GPT backup -> qm rescan
+Steps: $steps
 EOF
 )
     fi
@@ -1180,10 +1363,10 @@ EOF
     do_shrink "$vmid"
     stop_gauge
 
-    local msg="Shrink complete.\n\nNew device size: $(human "$NEW_DEV_BYTES")\nLog: $LOGFILE"
-    if d_yesno "Done - start VM?" "$msg\n\nStart VM $vmid now?"; then
-        qm start "$vmid" >>"$LOGFILE" 2>&1 || die "qm start failed. Check the console."
-        msg="$msg\n\nVM started. Watch the console for a clean boot."
+    local msg="Shrink complete.\n\nNew size: $(human "$NEW_DEV_BYTES")\nLog: $LOGFILE"
+    if d_yesno "Done - start $noun?" "$msg\n\nStart $noun $vmid now?"; then
+        guest_start "$vmid" >>"$LOGFILE" 2>&1 || die "Starting $noun $vmid failed. Check the console."
+        msg="$msg\n\n$noun started. Watch the console for a clean boot."
     fi
     clear
     printf '%b\n' "$msg"
