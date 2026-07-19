@@ -20,10 +20,15 @@
 
 set -euo pipefail
 
+# Every size and geometry value below is parsed from the English output of sgdisk,
+# resize2fs, dumpe2fs, ntfsresize and lvm. Force the C locale so a localized host cannot
+# silently mis-parse those strings into empty values (which would corrupt the geometry math).
+export LC_ALL=C LANG=C
+
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.1.0"
+VERSION="1.2.0"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -367,14 +372,6 @@ partdev() {
 
 detach_disk() { cleanup; }
 
-# Partition number with the greatest end sector, optionally excluding one number.
-# The shrinkable partition is always the physically last one, which is not always
-# the highest numbered one (cloud images number root as part1 but place it last).
-_last_by_end() {
-    sgdisk -p "$BASE" 2>/dev/null \
-        | awk -v ex="${1:--1}" '/^ *[0-9]+ /{if($1!=ex && $3+0>m){m=$3+0;n=$1}} END{print n}'
-}
-
 # Read partition number $1 into LAST_N / LAST_START / LAST_END / LAST_TYPE /
 # LAST_GUID / LAST_NAME / LAST_DEV / LAST_FS.
 _read_part() {
@@ -386,8 +383,25 @@ _read_part() {
     LAST_TYPE=$(sed -n 's/Partition GUID code: \([0-9A-Fa-f-]*\).*/\1/p' <<<"$info")
     LAST_GUID=$(sed -n 's/Partition unique GUID: \([0-9A-Fa-f-]*\).*/\1/p' <<<"$info")
     LAST_NAME=$(sed -n "s/Partition name: '\(.*\)'/\1/p" <<<"$info")
+    LAST_ATTRS=$(sed -n 's/.*Attribute flags: *\([0-9A-Fa-f]*\).*/\1/p' <<<"$info")
     LAST_DEV=$(partdev "$n")
     LAST_FS=$(blkid -o value -s TYPE "$LAST_DEV" 2>/dev/null || echo "")
+    # Bad geometry (e.g. a localized sgdisk or an unexpected layout) must stop us before any
+    # arithmetic runs on empty values and corrupts the partition table.
+    [[ "$LAST_START" =~ ^[0-9]+$ && "$LAST_END" =~ ^[0-9]+$ ]] \
+        || die "Could not read partition $n geometry from sgdisk (start='$LAST_START' end='$LAST_END')."
+}
+
+# Restore GPT attribute flags on a freshly recreated partition. sgdisk -n drops them, so
+# Windows Recovery (bits 63/0) and BIOS-GPT bios_grub (bit 2) would otherwise lose their
+# flags. The new partition starts with a zero attribute field, so OR-ing the saved mask sets
+# exactly the original bits. Non-fatal: a completed shrink must not be undone if a flag does
+# not stick.
+apply_attrs() {   # partnum hexmask
+    local n=$1 attrs=$2
+    [[ "$attrs" =~ ^[0-9A-Fa-f]+$ && ! "$attrs" =~ ^0+$ ]] || return 0
+    sgdisk "--attributes=${n}:or:${attrs}" "$BASE" >>"$LOGFILE" 2>&1 \
+        || log "warning: could not restore attribute flags $attrs on partition $n"
 }
 
 # A filesystem this tool can shrink in place.
@@ -406,6 +420,26 @@ fs_note() {
         "")              echo "no filesystem (reserved)" ;;
         *)               echo "$1 (not shrinkable)" ;;
     esac
+}
+
+# A friendly one-line name for the disk's partition scheme, shown in the confirm summary so
+# the user can see the tool recognised the layout. Runs after analyze (needs ALL_PARTS).
+classify_layout() {
+    [[ ${NO_GPT:-0} -eq 1 ]] && { echo "whole-disk ${LAST_FS:-unknown} (no partition table)"; return; }
+    [[ $GUEST_LVM -eq 1 ]] && { echo "Linux LVM on GPT"; return; }
+    local line fs ntfs=0 ext=0 xfs=0 esp=0 bl=0
+    for line in "${ALL_PARTS[@]}"; do
+        IFS=$'\t' read -r _ _ _ fs <<<"$line"
+        case "$fs" in
+            ntfs) ntfs=1 ;; ext2|ext3|ext4) ext=1 ;; xfs) xfs=1 ;;
+            vfat) esp=1 ;; BitLocker) bl=1 ;;
+        esac
+    done
+    if   (( ntfs || bl )); then echo "Windows (NTFS on GPT)"
+    elif (( xfs ));        then echo "Linux XFS on GPT"
+    elif (( ext && esp )); then echo "Linux ext (UEFI/GPT)"
+    elif (( ext ));        then echo "Linux ext (GPT)"
+    else echo "GPT"; fi
 }
 
 # Explain how to shrink a BitLocker-encrypted volume (only Windows can do it), shown
@@ -451,7 +485,7 @@ choose_partition() {
 analyze() {
     SECTOR_SIZE=$(blockdev --getss "$BASE")
     SECTORS=$(blockdev --getsz "$BASE")
-    NO_GPT=0; GUEST_LVM=0; ALL_PARTS=(); TRAIL=()
+    NO_GPT=0; GUEST_LVM=0; ALL_PARTS=(); TRAIL=(); TRAILING_ONLY=0; LVM_COMPACT=0
 
     # Whole-disk case: a filesystem or LVM PV sits directly on the device, no
     # partition table. Common for secondary data disks. Detect and handle without
@@ -466,7 +500,10 @@ analyze() {
         log "analyze whole-disk fs=$LAST_FS on $BASE (no partition table)"
         return 0
     fi
-    [[ "$pttype" == gpt || -z "$pttype" ]] || die "Disk $BASE has a $pttype partition table; only GPT and whole-disk are supported."
+    if [[ "$pttype" == dos ]]; then
+        die "Disk $DISK_KEY uses an MBR (msdos) partition table, which this tool does not shrink.\n\nMBR is common on BIOS-installed Debian and Windows VMs. Options:\n - Convert the disk to GPT (e.g. gdisk 'w', or sgdisk --mbrtogpt) and re-run this tool, or\n - Shrink it with GParted from a live ISO.\n\nNothing was changed."
+    fi
+    [[ "$pttype" == gpt || -z "$pttype" ]] || die "Disk $DISK_KEY has a '$pttype' partition table; only GPT and whole-disk are supported. Nothing was changed."
 
     # GPT case: scan all partitions and default to the largest shrinkable one. The user
     # can override this in select_partition.
@@ -513,42 +550,96 @@ ensure_clean_fs() {
 # ---------------------------------------------------------------------------
 # 5. Compute minimum data size and safe target
 # ---------------------------------------------------------------------------
+# Activate the guest volume group and scope every LVM command to just this PV. The host
+# global_filter usually rejects zvols (/dev/zd*), so a permissive filter plus an explicit
+# --devices list means we neither depend on the host filter nor ever touch another VG.
+# use_lvmpolld=0 makes pvmove block in the foreground until 100% (see do_shrink). Sets
+# LVM_CFG, ACTIVE_VG, GUEST_PV, the PV geometry (PV_EXTENT, PV_PESTART, PV_ALLOC) and
+# PV_USED_BYTES (smallest the PV can be with no filesystem shrink), plus LVM_HAS_EXT (an
+# ext LV exists that we could shrink to go smaller) and LVM_FS_LIST for the summary.
+lvm_prepare() {
+    GUEST_PV=$LAST_DEV
+    local pvreal; pvreal=$(readlink -f "$GUEST_PV")
+    LVM_CFG=(--config 'devices/global_filter=["a|.*|"] global/use_lvmpolld=0' --devices "$pvreal")
+    ACTIVE_VG=$(pvs "${LVM_CFG[@]}" --noheadings -o vg_name "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
+    [[ -n "$ACTIVE_VG" ]] || die "Could not find a volume group on $GUEST_PV."
+    vgchange "${LVM_CFG[@]}" -ay "$ACTIVE_VG" >>"$LOGFILE" 2>&1 || die "Could not activate guest VG $ACTIVE_VG."
+    PV_EXTENT=$(vgs "${LVM_CFG[@]}" --noheadings --units b --nosuffix -o vg_extent_size "$ACTIVE_VG" 2>>"$LOGFILE" | tr -d ' ')
+    PV_PESTART=$(pvs "${LVM_CFG[@]}" --noheadings --units b --nosuffix -o pe_start "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
+    PV_ALLOC=$(pvs "${LVM_CFG[@]}" --noheadings -o pv_pe_alloc_count "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
+    [[ "$PV_EXTENT" =~ ^[0-9]+$ && "$PV_PESTART" =~ ^[0-9]+$ && "$PV_ALLOC" =~ ^[0-9]+$ ]] \
+        || die "Could not read LVM geometry (extent=$PV_EXTENT pe_start=$PV_PESTART alloc=$PV_ALLOC)."
+    PV_USED_BYTES=$(( PV_PESTART + PV_ALLOC * PV_EXTENT ))
+    LVM_HAS_EXT=0; LVM_FS_LIST=""
+    local lv dev fstype
+    while read -r lv; do
+        [[ -n "$lv" ]] || continue
+        dev="/dev/$ACTIVE_VG/$lv"
+        fstype=$(blkid -o value -s TYPE "$dev" 2>/dev/null || echo "")
+        case "$fstype" in ext2|ext3|ext4) LVM_HAS_EXT=1 ;; esac
+        LVM_FS_LIST+="${lv}(${fstype:-none}) "
+    done < <(lvs "${LVM_CFG[@]}" --noheadings -o lv_name "$ACTIVE_VG" 2>>"$LOGFILE" | awk '{print $1}')
+    log "lvm_prepare vg=$ACTIVE_VG extent=$PV_EXTENT pe_start=$PV_PESTART alloc=$PV_ALLOC used=$PV_USED_BYTES has_ext=$LVM_HAS_EXT fs=[$LVM_FS_LIST]"
+}
+
+# Deep guest-LVM path only: to go BELOW the used size we must shrink a filesystem. Pick the
+# largest ext LV, and set MIN_FS_BYTES, FS_TARGET_DEV and LV_TARGET_CUR (its current size).
+# XFS LVs cannot shrink, so if none is ext we refuse and point at the compact option.
+compute_min_lv() {
+    local lv dev fstype best_dev="" best_size=0 size
+    while read -r lv size; do
+        dev="/dev/$ACTIVE_VG/$lv"
+        fstype=$(blkid -o value -s TYPE "$dev" 2>/dev/null || echo "")
+        case "$fstype" in ext2|ext3|ext4) ;; *) continue ;; esac
+        if (( size > best_size )); then best_size=$size; best_dev=$dev; fi
+    done < <(lvs "${LVM_CFG[@]}" --noheadings --units b --nosuffix -o lv_name,lv_size "$ACTIVE_VG" 2>>"$LOGFILE" | awk '{print $1, $2}')
+    [[ -n "$best_dev" ]] || die "No ext filesystem in VG $ACTIVE_VG can be shrunk (XFS cannot shrink). Use the compact option to reclaim the volume group's free space instead."
+    FS_TARGET_DEV=$best_dev; LV_TARGET_CUR=$best_size
+    ensure_clean_fs "$FS_TARGET_DEV"
+    local minblk blksz
+    minblk=$(resize2fs -P "$FS_TARGET_DEV" 2>/dev/null | awk -F': ' '/Estimated minimum size/{print $2}')
+    blksz=$(dumpe2fs -h "$FS_TARGET_DEV" 2>/dev/null | awk -F': *' '/Block size/{print $2}')
+    [[ -n "$minblk" && -n "$blksz" ]] || die "Could not estimate the minimum filesystem size."
+    MIN_FS_BYTES=$(( minblk * blksz ))
+    log "compute_min_lv target=$FS_TARGET_DEV cur=$LV_TARGET_CUR min_fs_bytes=$MIN_FS_BYTES ($(human "$MIN_FS_BYTES"))"
+}
+
+# Plan the resulting geometry for a guest-LVM shrink from a desired PV size (bytes). Rounds
+# the PV up to a whole extent, then derives the partition end (or whole-disk size) and the
+# device size. Sets PV_TARGET_BYTES NEW_LAST_END NEW_DEV_BYTES TRAIL_NEW. do_shrink later
+# recomputes the exact PV size from the real post-pvmove geometry; this is the plan/summary.
+plan_lvm() {
+    local pv=$1 ext=$PV_EXTENT ps=$PV_PESTART
+    local need_ext=$(( (pv - ps + ext - 1) / ext )); (( need_ext < 1 )) && need_ext=1
+    PV_TARGET_BYTES=$(( ps + need_ext * ext ))
+    if [[ ${NO_GPT:-0} -eq 1 ]]; then
+        local d; d=$(roundup "$PV_TARGET_BYTES" "$MIB")
+        [[ "$BACKEND" == zvol ]] && d=$(roundup "$d" "$VOLBLK")
+        NEW_DEV_BYTES=$d; NEW_LAST_END=0; TRAIL_NEW=()
+    else
+        local align=$(( MIB / SECTOR_SIZE )) psec
+        psec=$(( (PV_TARGET_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE ))
+        NEW_LAST_END=$(( LAST_START + psec - 1 ))
+        NEW_LAST_END=$(( ( (NEW_LAST_END + align) / align ) * align - 1 ))
+        place_trailing
+    fi
+    log "plan_lvm pv_target=$PV_TARGET_BYTES part_end=${NEW_LAST_END:-na} dev=$NEW_DEV_BYTES compact=${LVM_COMPACT:-0}"
+}
+
 # Determines the minimum size of the chosen filesystem (ext via resize2fs -P, NTFS via
-# ntfsresize --info) and sets MIN_FS_BYTES (data floor), FS_TARGET_DEV (what to resize)
-# and GUEST_PV (when guest LVM).
+# ntfsresize --info) and sets MIN_FS_BYTES (data floor) and FS_TARGET_DEV. Non-LVM only;
+# guest LVM is handled by lvm_prepare / compute_min_lv.
 compute_min() {
     GUEST_PV=""
-    if [[ $GUEST_LVM -eq 1 ]]; then
-        GUEST_PV=$LAST_DEV
-        # The host LVM global_filter often rejects zvols (/dev/zd*). Scope every LVM
-        # command to just this device with a permissive filter so we neither depend on
-        # the host filter nor accidentally touch any other volume group.
-        local pvreal; pvreal=$(readlink -f "$GUEST_PV")
-        LVM_CFG=(--config 'devices/global_filter=["a|.*|"]' --devices "$pvreal")
-        ACTIVE_VG=$(pvs "${LVM_CFG[@]}" --noheadings -o vg_name "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
-        [[ -n "$ACTIVE_VG" ]] || die "Could not find a volume group on $GUEST_PV."
-        vgchange "${LVM_CFG[@]}" -ay "$ACTIVE_VG" >>"$LOGFILE" 2>&1 || die "Could not activate guest VG $ACTIVE_VG."
-        # pick the largest LV that holds an ext filesystem as the shrink target
-        local lv dev fstype best_dev="" best_size=0 size
-        while read -r lv size; do
-            dev="/dev/$ACTIVE_VG/$lv"
-            fstype=$(blkid -o value -s TYPE "$dev" 2>/dev/null || echo "")
-            case "$fstype" in ext2|ext3|ext4) ;; xfs) die "Guest LV $dev is XFS and cannot be shrunk." ;; *) continue ;; esac
-            if (( size > best_size )); then best_size=$size; best_dev=$dev; fi
-        done < <(lvs "${LVM_CFG[@]}" --noheadings --units b --nosuffix -o lv_name,lv_size "$ACTIVE_VG" 2>>"$LOGFILE" | awk '{print $1, $2}')
-        [[ -n "$best_dev" ]] || die "No shrinkable ext filesystem found in guest VG $ACTIVE_VG."
-        FS_TARGET_DEV=$best_dev
-    else
-        case "$LAST_FS" in
-            ext2|ext3|ext4|ntfs) FS_TARGET_DEV=$LAST_DEV ;;
-            xfs)        die "Partition $LAST_DEV is XFS and cannot be shrunk." ;;
-            BitLocker)  bitlocker_note; die "BitLocker volume on $LAST_DEV not shrunk (encrypted; see the note)." ;;
-            "")         die "Could not detect a filesystem on $LAST_DEV." ;;
-            *)          die "Unsupported filesystem '$LAST_FS' on $LAST_DEV (supported: ext2/3/4, NTFS, guest LVM)." ;;
-        esac
-    fi
+    case "$LAST_FS" in
+        ext2|ext3|ext4|ntfs) FS_TARGET_DEV=$LAST_DEV ;;
+        xfs)        die "Partition $LAST_DEV is XFS and cannot be shrunk. Reclaim only the free space after it (the trailing-only option) instead." ;;
+        BitLocker)  bitlocker_note; die "BitLocker volume on $LAST_DEV not shrunk (encrypted; see the note)." ;;
+        "")         die "Could not detect a filesystem on $LAST_DEV." ;;
+        *)          die "Unsupported filesystem '$LAST_FS' on $LAST_DEV (supported: ext2/3/4, NTFS, guest LVM)." ;;
+    esac
 
-    if [[ "$LAST_FS" == ntfs && $GUEST_LVM -eq 0 ]]; then
+    if [[ "$LAST_FS" == ntfs ]]; then
         ntfs_prepare "$FS_TARGET_DEV"        # dep check + clean-state guard + MIN_FS_BYTES
     else
         ensure_clean_fs "$FS_TARGET_DEV"
@@ -629,6 +720,74 @@ place_trailing() {
     NEW_DEV_BYTES=$dev_bytes
 }
 
+# Free space (bytes) after the physically-last partition — reclaimable by simply cutting
+# the device down to that partition's end, touching no filesystem, partition or LVM.
+# Sets DISK_LAST_END (sector) and TRAIL_FREE_BYTES.
+compute_trailing_free() {
+    DISK_LAST_END=0; TRAIL_FREE_BYTES=0
+    [[ ${NO_GPT:-0} -eq 0 ]] || return 0
+    local line n s e fs
+    for line in "${ALL_PARTS[@]}"; do
+        IFS=$'\t' read -r n s e fs <<<"$line"
+        (( e > DISK_LAST_END )) && DISK_LAST_END=$e
+    done
+    local free_sec=$(( SECTORS - 1 - DISK_LAST_END - 34 ))   # keep room for the GPT backup
+    (( free_sec > 0 )) && TRAIL_FREE_BYTES=$(( free_sec * SECTOR_SIZE ))
+    log "compute_trailing_free last_end=$DISK_LAST_END free=$TRAIL_FREE_BYTES"
+}
+
+# Plan a shrink that only reclaims the trailing free space: the device is cut down to the
+# last partition's end. No filesystem, partition or LVM is touched, so it is safe on any
+# layout (XFS, multi-LV LVM, ...). Sets TRAILING_ONLY and the size globals do_shrink needs.
+plan_trailing_only() {
+    TRAILING_ONLY=1; TRAIL_NEW=()
+    NEW_LAST_END=$DISK_LAST_END
+    local dev; dev=$(( (DISK_LAST_END + 34) * SECTOR_SIZE ))
+    dev=$(roundup "$dev" "$MIB")
+    [[ "$BACKEND" == zvol ]] && dev=$(roundup "$dev" "$VOLBLK")
+    NEW_DEV_BYTES=$dev; NEW_FS_BYTES=0; MIN_FS_BYTES=0
+    log "plan_trailing_only dev=$NEW_DEV_BYTES"
+}
+
+# Ask whether to only reclaim the trailing free space (safe) or shrink the partition's
+# filesystem to get more (advanced). Sets SHRINK_MODE=trailing|partition; 1 on cancel.
+ask_mode() {
+    local cur=$(( SECTORS * SECTOR_SIZE )) db choice
+    db=$(( (DISK_LAST_END + 34) * SECTOR_SIZE )); db=$(roundup "$db" "$MIB")
+    [[ "$BACKEND" == zvol ]] && db=$(roundup "$db" "$VOLBLK")
+    choice=$(d_menu "How to shrink" \
+        "There is $(human "$TRAIL_FREE_BYTES") of free space after the last partition on $DISK_KEY.\n\nHow do you want to shrink it?" 6 \
+        trailing  "Reclaim that free space only  ($(human "$cur") -> $(human "$db"))  [safe, no filesystem change]" \
+        partition "Shrink the last partition's filesystem to reclaim more  [advanced]") || return 1
+    SHRINK_MODE=$choice
+}
+
+# Guest-LVM mode chooser. Offers, in increasing invasiveness: trailing-only (cut the disk
+# after the LVM partition, LVM untouched), compact (pvmove the VG's free space out and shrink
+# the PV, no filesystem touched -- works with XFS), and shrinkfs (also reduce an ext LV to go
+# below the used size). Sets SHRINK_MODE; returns 1 on cancel.
+ask_lvm_mode() {
+    local cur=$(( SECTORS * SECTOR_SIZE )) args=() choice
+    if [[ ${NO_GPT:-0} -eq 0 ]] && (( TRAIL_FREE_BYTES >= 1024*MIB )); then
+        local db=$(( (DISK_LAST_END + 34) * SECTOR_SIZE )); db=$(roundup "$db" "$MIB")
+        [[ "$BACKEND" == zvol ]] && db=$(roundup "$db" "$VOLBLK")
+        args+=(trailing "Reclaim only the free space AFTER the LVM partition ($(human "$cur") -> $(human "$db"))  [safest, LVM untouched]")
+    fi
+    args+=(compact "Compact the volume group and reclaim its free space too  [no filesystem touched, XFS-safe]")
+    (( LVM_HAS_EXT )) && args+=(shrinkfs "Also shrink an ext filesystem to go below the used size  [advanced]")
+    choice=$(d_menu "How to shrink LVM disk $DISK_KEY" \
+        "Volume group: $ACTIVE_VG\nVolumes: $LVM_FS_LIST\nUsed by the VG: $(human "$PV_USED_BYTES")\n\nChoose how to shrink it:" 6 "${args[@]}") || return 1
+    SHRINK_MODE=$choice
+}
+
+# Compact plan: shrink the PV down to the used size (pvmove + pvresize in do_shrink), no
+# filesystem is resized. Safe for any filesystem inside the VG, including XFS.
+plan_lvm_compact() {
+    LVM_COMPACT=1
+    plan_lvm "$PV_USED_BYTES"
+    MIN_FS_BYTES=$PV_USED_BYTES; NEW_FS_BYTES=0
+}
+
 # ---------------------------------------------------------------------------
 # 6. Ask for target size (headroom presets or manual)
 # ---------------------------------------------------------------------------
@@ -666,11 +825,18 @@ ask_target() {
 # ---------------------------------------------------------------------------
 do_shrink() {
     local vmid=$1
-    # 7.1 shrink filesystem
-    if [[ $GUEST_LVM -eq 1 ]]; then
-        log "lvreduce --resizefs -L ${NEW_FS_BYTES}B $FS_TARGET_DEV"
-        ( lvreduce "${LVM_CFG[@]}" --resizefs -f -L "${NEW_FS_BYTES}B" "$FS_TARGET_DEV" >>"$LOGFILE" 2>&1 ) &
-        gauge_wait $! 15 45 "Shrinking filesystem (LVM)" || die "lvreduce failed. See $LOGFILE"
+    # 7.1 shrink filesystem (skipped when only reclaiming trailing free space)
+    if [[ ${TRAILING_ONLY:-0} -eq 1 ]]; then
+        : # nothing to resize; the device is simply cut down to the last partition's end
+    elif [[ $GUEST_LVM -eq 1 ]]; then
+        # Compact mode reclaims only the VG's free space and never touches a filesystem, so
+        # the lvreduce is skipped entirely (this is what makes XFS guests shrinkable). Deep
+        # mode reduces one ext LV first to free extents below the target.
+        if [[ ${LVM_COMPACT:-0} -eq 0 ]]; then
+            log "lvreduce --resizefs -L ${NEW_FS_BYTES}B $FS_TARGET_DEV"
+            ( lvreduce "${LVM_CFG[@]}" --resizefs -f -L "${NEW_FS_BYTES}B" "$FS_TARGET_DEV" >>"$LOGFILE" 2>&1 ) &
+            gauge_wait $! 15 45 "Shrinking filesystem (LVM)" || die "lvreduce failed. See $LOGFILE"
+        fi
         # Smallest PV size that still holds every allocated extent:
         # first-extent offset + allocated extents * extent size, plus one extent of slack.
         # pe_start can be large on zvol backed PVs (32 MiB data alignment), so it is read,
@@ -681,8 +847,21 @@ do_shrink() {
         alloc=$(pvs "${LVM_CFG[@]}" --noheadings -o pv_pe_alloc_count "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
         [[ "$extent" =~ ^[0-9]+$ && "$pestart" =~ ^[0-9]+$ && "$alloc" =~ ^[0-9]+$ ]] \
             || die "Could not read LVM geometry (extent=$extent pe_start=$pestart alloc=$alloc)."
-        PV_TARGET_BYTES=$(( pestart + (alloc + 1) * extent ))
-        log "lvm geometry extent=$extent pe_start=$pestart alloc=$alloc pv_target=$PV_TARGET_BYTES"
+        local target_ext=$(( alloc + 1 ))
+        PV_TARGET_BYTES=$(( pestart + target_ext * extent ))
+        log "lvm geometry extent=$extent pe_start=$pestart alloc=$alloc target_ext=$target_ext pv_target=$PV_TARGET_BYTES"
+        # pvresize only shrinks a PV if its physically-last extents are free. After reducing
+        # one LV the freed extents can sit anywhere, so any extent still allocated at or
+        # beyond the target offset is first moved down into that free space. Multi-LV VGs
+        # (e.g. the Rocky/RHEL root+home+swap+tmp layout) need this, or pvresize aborts with
+        # "cannot resize ... as later ones are allocated".
+        progress 46 "Compacting physical extents"
+        local pmout
+        if ! pmout=$(pvmove -y --alloc anywhere "${LVM_CFG[@]}" "${GUEST_PV}:${target_ext}-" 2>&1); then
+            echo "$pmout" >>"$LOGFILE"
+            grep -qiE 'No data to move|no extents in range|does not exist' <<<"$pmout" \
+                || die "pvmove (compacting extents before shrink) failed. See $LOGFILE"
+        fi
         progress 48 "Resizing physical volume"
         pvresize -y "${LVM_CFG[@]}" --setphysicalvolumesize "${PV_TARGET_BYTES}B" "$GUEST_PV" >>"$LOGFILE" 2>&1 \
             || die "pvresize failed. See $LOGFILE"
@@ -710,8 +889,9 @@ do_shrink() {
         gauge_wait $! 15 50 "Shrinking filesystem" || die "resize2fs failed. See $LOGFILE"
     fi
 
-    # 7.2 / 7.3 partition work only applies to partitioned (GPT) disks
-    if [[ ${NO_GPT:-0} -eq 0 ]]; then
+    # 7.2 / 7.3 partition work only applies to partitioned (GPT) disks, and is skipped when
+    # only reclaiming trailing free space (no partition is resized or moved then)
+    if [[ ${NO_GPT:-0} -eq 0 && ${TRAILING_ONLY:-0} -eq 0 ]]; then
         # capture trailing swap UUIDs now, while the original partition mapping is intact
         declare -A SWAP_UUIDS=()
         local te tn tf
@@ -728,10 +908,11 @@ do_shrink() {
                -t "${LAST_N}:${LAST_TYPE}" -u "${LAST_N}:${LAST_GUID}" \
                ${LAST_NAME:+-c "${LAST_N}:${LAST_NAME}"} "$BASE" >>"$LOGFILE" 2>&1 \
             || die "Recreating partition $LAST_N failed. The original layout is in $LOGFILE."
+        apply_attrs "$LAST_N" "${LAST_ATTRS:-}"
 
         # move every trailing partition down into the freed space, keeping order and
         # identity. Data partitions are relocated block-for-block; swap is recreated.
-        local e num os oe ns ne fs info tguid tuniq tname cnt suuid pct=57
+        local e num os oe ns ne fs info tguid tuniq tname tattrs cnt suuid pct=57
         for e in "${TRAIL_NEW[@]:-}"; do
             [[ -n "$e" ]] || continue
             IFS=: read -r num os oe ns ne fs <<<"$e"
@@ -739,11 +920,13 @@ do_shrink() {
             tguid=$(sed -n 's/Partition GUID code: \([0-9A-Fa-f-]*\).*/\1/p' <<<"$info")
             tuniq=$(sed -n 's/Partition unique GUID: \([0-9A-Fa-f-]*\).*/\1/p' <<<"$info")
             tname=$(sed -n "s/Partition name: '\(.*\)'/\1/p" <<<"$info")
+            tattrs=$(sed -n 's/.*Attribute flags: *\([0-9A-Fa-f]*\).*/\1/p' <<<"$info")
             if [[ "$fs" == swap ]]; then
                 suuid=${SWAP_UUIDS[$num]:-}
                 sgdisk -d "$num" "$BASE" >>"$LOGFILE" 2>&1
                 sgdisk -n "${num}:${ns}:${ne}" -t "${num}:${tguid}" -u "${num}:${tuniq}" \
                        ${tname:+-c "${num}:${tname}"} "$BASE" >>"$LOGFILE" 2>&1 || die "Recreating swap $num failed."
+                apply_attrs "$num" "$tattrs"
                 partx -u "$BASE" >>"$LOGFILE" 2>&1 || true; udevadm settle 2>/dev/null || true; sleep 1
                 progress "$pct" "Recreating swap (part $num)"
                 mkswap ${suuid:+-U "$suuid"} "$(partdev "$num")" >>"$LOGFILE" 2>&1 || die "mkswap failed on part $num."
@@ -759,6 +942,7 @@ do_shrink() {
                 sgdisk -d "$num" "$BASE" >>"$LOGFILE" 2>&1
                 sgdisk -n "${num}:${ns}:${ne}" -t "${num}:${tguid}" -u "${num}:${tuniq}" \
                        ${tname:+-c "${num}:${tname}"} "$BASE" >>"$LOGFILE" 2>&1 || die "Recreating moved partition $num failed."
+                apply_attrs "$num" "$tattrs"
             fi
             pct=$((pct+8)); (( pct > 66 )) && pct=66
         done
@@ -873,15 +1057,40 @@ main() {
         clear; exit 0
     fi
 
-    # attach + analyze + choose partition + compute minimum
+    # attach + analyze + choose partition
     attach_disk
     analyze
     select_partition
-    compute_min
+    compute_trailing_free
 
-    # choose target
-    ask_target || { detach_disk; clear; exit 0; }
-    plan_sizes "$CHOSEN_FS_BYTES"
+    # Choose the shrink mode. Guest LVM gets its own chooser (trailing / compact / shrinkfs);
+    # everything else picks between trailing-only and shrinking the partition's filesystem.
+    # Prefer the safe path: reclaim free space without touching a filesystem whenever possible.
+    if [[ $GUEST_LVM -eq 1 ]]; then
+        lvm_prepare
+        ask_lvm_mode || { detach_disk; clear; exit 0; }
+    else
+        SHRINK_MODE=partition
+        if (( TRAIL_FREE_BYTES >= 1024*MIB )); then
+            ask_mode || { detach_disk; clear; exit 0; }
+        fi
+    fi
+
+    case "$SHRINK_MODE" in
+        trailing) plan_trailing_only ;;
+        compact)  plan_lvm_compact ;;
+        shrinkfs)
+            compute_min_lv
+            ask_target || { detach_disk; clear; exit 0; }
+            NEW_FS_BYTES=$(roundup "$CHOSEN_FS_BYTES" "$MIB")
+            plan_lvm "$(( PV_USED_BYTES - (LV_TARGET_CUR - NEW_FS_BYTES) ))"
+            ;;
+        *)  # non-LVM partition filesystem shrink
+            compute_min
+            ask_target || { detach_disk; clear; exit 0; }
+            plan_sizes "$CHOSEN_FS_BYTES"
+            ;;
+    esac
 
     # safety: never grow, and require a meaningful reduction
     local cur_bytes=$(( SECTORS * SECTOR_SIZE ))
@@ -892,22 +1101,56 @@ main() {
     fi
 
     # summary / confirmation
-    local layout
+    local scheme layout
+    scheme=$(classify_layout)
     if [[ ${NO_GPT:-0} -eq 1 ]]; then
         layout="whole-disk $LAST_FS (no partition table)"
     elif [[ $GUEST_LVM -eq 1 ]]; then
-        layout="guest LVM (VG $ACTIVE_VG), partition $LAST_N"
+        layout="LVM on GPT (VG $ACTIVE_VG: ${LVM_FS_LIST% })"
     else
         layout="$LAST_FS, partition $LAST_N"
     fi
     (( ${#TRAIL_NEW[@]} )) && layout="$layout, ${#TRAIL_NEW[@]} partition(s) after it moved down (order kept)"
     local summary
-    summary=$(cat <<EOF
+    if [[ ${TRAILING_ONLY:-0} -eq 1 ]]; then
+        summary=$(cat <<EOF
 
 VM:              $vmid
 Disk:            $DISK_KEY  ($DISK_VOL)
+Scheme:          $scheme
 Backend:         $BACKEND
-Path:            $DISK_PATH
+Layout:          $layout
+Mode:            reclaim trailing free space only (no filesystem/partition/LVM change)
+
+Free after last partition: $(human "$TRAIL_FREE_BYTES")
+New device size: $(human "$NEW_DEV_BYTES")   (currently $(human $(( SECTORS * SECTOR_SIZE ))))
+
+Steps: shrink $BACKEND -> fix GPT backup -> qm rescan
+EOF
+)
+    elif [[ ${LVM_COMPACT:-0} -eq 1 ]]; then
+        summary=$(cat <<EOF
+
+VM:              $vmid
+Disk:            $DISK_KEY  ($DISK_VOL)
+Scheme:          $scheme
+Backend:         $BACKEND
+Layout:          $layout
+Mode:            compact the volume group (pvmove + pvresize; no filesystem is touched)
+
+Used by the VG:  $(human "$PV_USED_BYTES")
+New device size: $(human "$NEW_DEV_BYTES")   (currently $(human $(( SECTORS * SECTOR_SIZE ))))
+
+Steps: compact PV -> shrink partition $LAST_N -> shrink $BACKEND -> fix GPT backup -> qm rescan
+EOF
+)
+    else
+        summary=$(cat <<EOF
+
+VM:              $vmid
+Disk:            $DISK_KEY  ($DISK_VOL)
+Scheme:          $scheme
+Backend:         $BACKEND
 Layout:          $layout
 
 Data in use:     $(human "$MIN_FS_BYTES")
@@ -918,6 +1161,7 @@ Steps: resize filesystem -> shrink partition -> move trailing partitions ->
        shrink $BACKEND -> fix GPT backup -> qm rescan
 EOF
 )
+    fi
     if [[ $DRY_RUN -eq 1 ]]; then
         detach_disk
         d_msg "Dry run (no changes made)" "$summary" 22 78
