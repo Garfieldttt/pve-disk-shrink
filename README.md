@@ -140,3 +140,10 @@ finishes in the background; this is expected.
 ## Logs
 
 Everything is logged to `/var/log/pve-disk-shrink/pve-disk-shrink.log`.
+<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-23" src="https://github.com/user-attachments/assets/74af4e2b-3695-4610-8c6a-4685cbc8a6f7" />
+<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-43" src="https://github.com/user-attachments/assets/ca459e4f-8617-46ea-be76-f81f1bce31d2" />
+<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 17-00-52" src="https://github.com/user-attachments/assets/4079daca-a909-4520-b33c-03e6cf71faf8" />
+<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-52" src="https://github.com/user-attachments/assets/be92fd14-c52a-4d80-a55a-b26a8c7eb3c3" />
+<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-57" src="https://github.com/user-attachments/assets/f227c8ce-dabd-495e-b426-aefc2db81625" />
+<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-58-08" src="https://github.com/user-attachments/assets/439fd285-b0e3-49eb-9f65-809ce3154da8" />
+<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 17-01-19" src="https://github.com/user-attachments/assets/8ce720a4-fe4c-4fb7-816a-b5b2a067fec9" />
