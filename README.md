@@ -23,8 +23,8 @@ the offline sequence that fits the layout:
   it are moved down into the freed space, keeping their order and identity; swap is recreated
   with its original UUID.
 - Shrink the backing device: `zfs set volsize` (zvol), `qemu-img resize --shrink` (qcow2 or
-  raw image), or `lvreduce` (LVM). For a ZFS subvol container the dataset refquota is lowered
-  and no filesystem is touched.
+  raw image), `rbd resize --allow-shrink` (Ceph/RBD), or `lvreduce` (LVM). For a ZFS subvol
+  container the dataset refquota is lowered and no filesystem is touched.
 - For a partitioned disk, move the GPT backup header to the new end (`sgdisk -e`) and verify
   the table (`sgdisk -v`).
 - Sync the new size back into the guest config (`qm rescan` for a VM, the container config for
@@ -38,7 +38,8 @@ normal case for containers.
 
 Guests: QEMU VMs (`qm`) and LXC containers (`pct`), listed together.
 
-VM storage backends: ZFS zvol, qcow2 image, raw LV.
+VM storage backends: ZFS zvol, qcow2 image, raw LV, Ceph/RBD (with KRBD enabled on the
+storage, so the image maps to `/dev/rbd`).
 
 Container storage backends: dir/raw image, LVM-thin, ZFS subvol.
 
@@ -76,13 +77,17 @@ Guest LVM (an LVM physical volume inside a VM disk) has three modes:
   GPT, or use GParted). Nothing is touched. A whole disk with no partition table is fine.
 - NTFS must be cleanly shut down. If the volume is hibernated or Fast Startup is on, the tool
   refuses. Boot Windows, disable Fast Startup, shut down fully, then retry.
+- Ceph/RBD is supported, but only with KRBD enabled on the storage, so the image is reachable as
+  a local `/dev/rbd` device. A volume served only through librbd has no local device; only that
+  case is refused, with a message telling you to enable KRBD and retry.
 
 ## Requirements
 
 Run it as root on a Proxmox VE node. It uses tools that ship with PVE: `qm`, `pct`, `pvesm`,
 `sgdisk`, `e2fsck`, `resize2fs`, `qemu-nbd`, `qemu-img`, `blkid`, `lsblk`, `partx`, `zfs`,
 `dialog`, `numfmt`. LVM needs `lvm2`. NTFS needs `ntfs-3g` and a raw-LV backed disk needs
-`kpartx`; the tool offers to install these when needed.
+`kpartx`; the tool offers to install these when needed. A Ceph/RBD disk needs `rbd`
+(ceph-common), which is already present on any PVE node that serves RBD storage.
 
 ## Usage
 
@@ -160,17 +165,3 @@ exit
 
 All actions, including the original partition layout, are logged to
 `/var/log/pve-disk-shrink/pve-disk-shrink.log`.
-<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-23" src="https://github.com/user-attachments/assets/74af4e2b-3695-4610-8c6a-4685cbc8a6f7" />
-<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-43" src="https://github.com/user-attachments/assets/ca459e4f-8617-46ea-be76-f81f1bce31d2" />
-<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 17-00-52" src="https://github.com/user-attachments/assets/4079daca-a909-4520-b33c-03e6cf71faf8" />
-<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-52" src="https://github.com/user-attachments/assets/be92fd14-c52a-4d80-a55a-b26a8c7eb3c3" />
-<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-57-57" src="https://github.com/user-attachments/assets/f227c8ce-dabd-495e-b426-aefc2db81625" />
-<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 16-58-08" src="https://github.com/user-attachments/assets/439fd285-b0e3-49eb-9f65-809ce3154da8" />
-<img width="2863" height="1492" alt="Bildschirmfoto vom 2026-07-19 17-01-19" src="https://github.com/user-attachments/assets/8ce720a4-fe4c-4fb7-816a-b5b2a067fec9" />
-
-
-
-
-
-
-
