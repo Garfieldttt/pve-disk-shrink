@@ -28,7 +28,7 @@ export LC_ALL=C LANG=C
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.3.0"
+VERSION="1.4.0"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -39,6 +39,8 @@ BACKTITLE="PVE Disk Shrink v$VERSION"
 GUEST_TYPE="vm"      # vm (qm) or ct (pct / LXC container)
 DATASET=""           # ZFS dataset name for a container subvol volume
 NBD_DEV=""            # /dev/nbdX if a qcow2 image is attached
+RBD_SPEC=""           # <pool>[/<namespace>]/<image> for a Ceph/RBD backend
+RBD_MAPPED=""         # RBD spec we mapped ourselves and must "rbd unmap"
 PARTX_BASE=""         # base device we ran "partx -a" against
 ACTIVE_VG=""          # guest volume group we activated and must deactivate
 LVM_CFG=()            # scoped LVM options (permissive filter + our device only)
@@ -102,6 +104,10 @@ cleanup() {
     if [[ -n "$NBD_DEV" ]]; then
         qemu-nbd -d "$NBD_DEV" >>"$LOGFILE" 2>&1 || true
         NBD_DEV=""
+    fi
+    if [[ -n "$RBD_MAPPED" ]]; then
+        rbd unmap "$RBD_MAPPED" >>"$LOGFILE" 2>&1 || true
+        RBD_MAPPED=""
     fi
 }
 trap cleanup EXIT
@@ -176,6 +182,11 @@ gauge_wait() {
 MIB=$((1024*1024))
 human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
 roundup() { local v=$1 a=$2; echo $(( (v + a - 1) / a * a )); }   # round v up to multiple of a
+
+# ",  frees ~<X>" for a target-size menu row: how much the host reclaims if the filesystem
+# ends up at <fs> bytes. Only shown when the current disk size is known (have_cur=1) and the
+# choice actually shrinks. It is an estimate (ignores GPT/trailing/alignment overhead), hence "~".
+freehint() { local hc=$1 cur=$2 fs=$3; [[ "$hc" == 1 ]] || return 0; (( cur > fs )) && printf ',  frees ~%s' "$(human $(( cur - fs )))"; }
 
 # Ensure a command is available, offering to install its package first. Always asks
 # before installing anything; dies if the user declines or the install fails.
@@ -362,6 +373,15 @@ discover_disk() {
         VOLBLK=$(numfmt --from=iec "$(zfs get -H -o value volblocksize "$ZVOL")")
     elif [[ "$DISK_PATH" == *.qcow2 || "$(qemu-img info --output=json "$DISK_PATH" 2>/dev/null | grep -o '"format": "qcow2"')" ]]; then
         BACKEND=qcow2
+    elif [[ "$DISK_PATH" == /dev/rbd/* || "$(readlink -f "$DISK_PATH" 2>/dev/null)" == /dev/rbd[0-9]* ]]; then
+        # Ceph/RBD with KRBD enabled: pvesm path yields /dev/rbd/<pool>[/<ns>]/<image>. The
+        # image is only mapped while the guest runs, so attach_disk maps it itself; here we
+        # just record the spec for "rbd map" / "rbd resize".
+        BACKEND=rbd
+        RBD_SPEC=${DISK_PATH#/dev/rbd/}
+        command -v rbd >/dev/null || die "rbd CLI (ceph-common) is required for the Ceph/RBD backend."
+    elif [[ "$DISK_PATH" == rbd:* ]]; then
+        die "This RBD volume is accessed through librbd (no local device). Enable 'KRBD' on the storage so it maps to /dev/rbd, then retry."
     elif [[ -b "$DISK_PATH" ]]; then
         BACKEND=rawlv
     else
@@ -415,6 +435,15 @@ attach_disk() {
             partx -a "$BASE" >>"$LOGFILE" 2>&1 || true
             PARTX_BASE=$BASE
             ;;
+        rbd)
+            # The image is unmapped while the guest is stopped, so map it now. KRBD exposes
+            # partitions as /dev/rbdNpM on its own; partx -a is a harmless belt-and-braces.
+            command -v rbd >/dev/null || die "rbd CLI (ceph-common) is required for the Ceph/RBD backend."
+            BASE=$(rbd map "$RBD_SPEC" 2>>"$LOGFILE") || die "rbd map $RBD_SPEC failed."
+            RBD_MAPPED=$RBD_SPEC
+            partx -a "$BASE" >>"$LOGFILE" 2>&1 || true
+            PARTX_BASE=$BASE
+            ;;
         rawfile|ctlvm)
             # Container volume: a filesystem sits directly on the file/LV, no partition table.
             BASE=$DISK_PATH
@@ -443,6 +472,7 @@ partdev() {
     case "$BACKEND" in
         zvol)  echo "${BASE}-part${n}" ;;
         qcow2) echo "${BASE}p${n}" ;;
+        rbd)   echo "${BASE}p${n}" ;;
         rawlv) [[ -e "${BASE}p${n}" ]] && echo "${BASE}p${n}" || echo "${BASE}${n}" ;;
     esac
 }
@@ -614,6 +644,12 @@ analyze() {
 ensure_clean_fs() {
     local dev=$1 rc=0
     e2fsck -fn "$dev" >>"$LOGFILE" 2>&1 || rc=$?
+    # A dry run must not write to the guest filesystem. The read-only check above is enough to
+    # surface errors for the plan, so skip the interactive repair and the writable forced check.
+    if [[ $DRY_RUN -eq 1 ]]; then
+        (( rc != 0 )) && log "dry-run: $dev has filesystem errors (e2fsck -fn rc=$rc); a real run would repair before shrinking"
+        return 0
+    fi
     if [[ $rc -ne 0 ]]; then
         if [[ -t 1 || -t 2 ]]; then
             d_yesno "Filesystem errors found" "e2fsck reports errors on the filesystem to shrink:\n\n  $dev\n\nA disk cannot be shrunk safely while its filesystem has errors.\n\nRun e2fsck now to repair it?" \
@@ -839,7 +875,7 @@ ask_mode() {
     db=$(( (DISK_LAST_END + 34) * SECTOR_SIZE )); db=$(roundup "$db" "$MIB")
     [[ "$BACKEND" == zvol ]] && db=$(roundup "$db" "$VOLBLK")
     choice=$(d_menu "How to shrink" \
-        "There is $(human "$TRAIL_FREE_BYTES") of free space after the last partition on $DISK_KEY.\n\nHow do you want to shrink it?" 6 \
+        "There is $(human "$TRAIL_FREE_BYTES") of free space after the last partition on $DISK_KEY.\n\ntrailing = cut off only the unused tail, no filesystem is touched (safe).\npartition = also shrink the filesystem itself to reclaim more (advanced).\n\nHow do you want to shrink it?" 8 \
         trailing  "Reclaim that free space only  ($(human "$cur") -> $(human "$db"))  [safe, no filesystem change]" \
         partition "Shrink the last partition's filesystem to reclaim more  [advanced]") || return 1
     SHRINK_MODE=$choice
@@ -859,7 +895,7 @@ ask_lvm_mode() {
     args+=(compact "Compact the volume group and reclaim its free space too  [no filesystem touched, XFS-safe]")
     (( LVM_HAS_EXT )) && args+=(shrinkfs "Also shrink an ext filesystem to go below the used size  [advanced]")
     choice=$(d_menu "How to shrink LVM disk $DISK_KEY" \
-        "Volume group: $ACTIVE_VG\nVolumes: $LVM_FS_LIST\nUsed by the VG: $(human "$PV_USED_BYTES")\n\nChoose how to shrink it:" 6 "${args[@]}") || return 1
+        "Volume group: $ACTIVE_VG\nVolumes: $LVM_FS_LIST\nUsed by the VG: $(human "$PV_USED_BYTES")\n\ntrailing = cut off the unused tail only, LVM untouched (safest).\ncompact  = also pack the VG and shrink the PV, no filesystem touched (XFS-safe).\nshrinkfs = also shrink an ext filesystem to go below the used size (advanced).\n\nChoose how to shrink it:" 8 "${args[@]}") || return 1
     SHRINK_MODE=$choice
 }
 
@@ -876,19 +912,30 @@ plan_lvm_compact() {
 # ---------------------------------------------------------------------------
 # Returns chosen filesystem size in bytes via CHOSEN_FS_BYTES
 ask_target() {
-    local floor=$MIN_FS_BYTES pct choice
-    local mtext="Data in use (filesystem minimum): $(human "$floor")\n\nChoose how much larger than the data the filesystem should be:"
+    local floor=$MIN_FS_BYTES pct choice cur=0 have_cur=0
+    # The current disk size is known for real disks (analyze ran). The ZFS-subvol path calls this
+    # without analyze, so SECTORS is unset; guard it so "Disk now" / "frees" just drop out there.
+    if [[ ${SECTORS:-} =~ ^[0-9]+$ && ${SECTOR_SIZE:-} =~ ^[0-9]+$ ]]; then
+        cur=$(( SECTORS * SECTOR_SIZE )); have_cur=1
+    fi
+    local mtext="How much free space should stay INSIDE the guest, on top of the data?\n\n"
+    (( have_cur )) && mtext+="Disk now:     $(human "$cur")\n"
+    mtext+="Data in use:  $(human "$floor")   (the smallest the filesystem can be)\n\n"
+    mtext+="Each option keeps that much room above the data. More room means more free\n"
+    mtext+="space left inside the VM but less reclaimed on the host; less room reclaims\n"
+    mtext+="more now but leaves the disk tighter. It never goes below the data size."
     while true; do
+        local f10=$(( floor*110/100 )) f20=$(( floor*120/100 )) f30=$(( floor*130/100 )) f40=$(( floor*140/100 )) f50=$(( floor*150/100 ))
         choice=$(d_menu "Target size" "$mtext" 8 \
-            10 "data + 10%   ($(human $(( floor*110/100 ))))" \
-            20 "data + 20%   ($(human $(( floor*120/100 ))))" \
-            30 "data + 30%   ($(human $(( floor*130/100 ))))" \
-            40 "data + 40%   ($(human $(( floor*140/100 ))))" \
-            50 "data + 50%   ($(human $(( floor*150/100 ))))" \
+            10 "data +10%  ->  fs $(human "$f10")$(freehint "$have_cur" "$cur" "$f10")" \
+            20 "data +20%  ->  fs $(human "$f20")$(freehint "$have_cur" "$cur" "$f20")" \
+            30 "data +30%  ->  fs $(human "$f30")$(freehint "$have_cur" "$cur" "$f30")" \
+            40 "data +40%  ->  fs $(human "$f40")$(freehint "$have_cur" "$cur" "$f40")" \
+            50 "data +50%  ->  fs $(human "$f50")$(freehint "$have_cur" "$cur" "$f50")" \
             manual "enter a size by hand (e.g. 12G)") || return 1
         if [[ "$choice" == manual ]]; then
             local v bytes
-            v=$(d_input "Manual size" "Enter target filesystem size (e.g. 12G, 8000M).\nMinimum is $(human "$floor")." "") || continue
+            v=$(d_input "Manual size" "Enter the target filesystem size, e.g. 12G or 8000M.\nMust be at least the data minimum ($(human "$floor")).\nThe disk ends up about this size plus a little overhead." "") || continue
             bytes=$(numfmt --from=iec "${v//B/}" 2>/dev/null) || { d_msg "Invalid" "Could not parse '$v'."; continue; }
             if (( bytes < floor )); then
                 d_msg "Too small" "Requested $(human "$bytes") is below the data minimum $(human "$floor"). Choose a larger size."
@@ -968,7 +1015,11 @@ do_shrink() {
         gauge_wait $! 15 50 "Shrinking NTFS filesystem" || die "ntfsresize failed. See $LOGFILE"
     else
         log "resize2fs $FS_TARGET_DEV ${NEW_FS_BYTES} bytes"
-        ( resize2fs "$FS_TARGET_DEV" "$(( NEW_FS_BYTES / 4096 ))" >>"$LOGFILE" 2>&1 ) &
+        # Pass the size with an "M" unit so resize2fs converts to the filesystem's real block
+        # size itself. A bare number is interpreted as a count of filesystem blocks, which is
+        # wrong for any block size other than 4096 (mkfs.ext4 uses 1024 on small volumes).
+        # NEW_FS_BYTES is always rounded up to a whole MiB (plan_sizes), so /MIB is exact.
+        ( resize2fs "$FS_TARGET_DEV" "$(( NEW_FS_BYTES / MIB ))M" >>"$LOGFILE" 2>&1 ) &
         gauge_wait $! 15 50 "Shrinking filesystem" || die "resize2fs failed. See $LOGFILE"
     fi
 
@@ -1048,6 +1099,13 @@ do_shrink() {
             ( qemu-img resize --shrink "$DISK_PATH" "${NEW_DEV_BYTES}" >>"$LOGFILE" 2>&1 ) &
             gauge_wait $! 70 90 "Shrinking $BACKEND image" || die "qemu-img resize failed."
             ;;
+        rbd)
+            # rbd --size is in MiB; NEW_DEV_BYTES is MiB-rounded. The image is unmapped here
+            # (detach_disk ran in 7.4), so the resize acts on the raw image.
+            log "rbd resize --allow-shrink --size $(( NEW_DEV_BYTES / MIB )) $RBD_SPEC"
+            ( rbd resize --allow-shrink --size "$(( NEW_DEV_BYTES / MIB ))" "$RBD_SPEC" >>"$LOGFILE" 2>&1 ) &
+            gauge_wait $! 70 90 "Shrinking RBD image" || die "rbd resize failed."
+            ;;
         rawfile)
             log "qemu-img resize --shrink -f raw $DISK_PATH ${NEW_DEV_BYTES}"
             ( qemu-img resize --shrink -f raw "$DISK_PATH" "${NEW_DEV_BYTES}" >>"$LOGFILE" 2>&1 ) &
@@ -1073,6 +1131,12 @@ do_shrink() {
         local vbase
         case "$BACKEND" in
             zvol|rawlv) vbase=$DISK_PATH ;;
+            rbd)
+                # re-map the resized image to move/verify its GPT backup header
+                BASE=$(rbd map "$RBD_SPEC" 2>>"$LOGFILE") || die "rbd map $RBD_SPEC failed (GPT step)."
+                RBD_MAPPED=$RBD_SPEC
+                vbase=$BASE
+                ;;
             qcow2)
                 modprobe nbd max_part=16 2>>"$LOGFILE" || true
                 local n
@@ -1091,6 +1155,7 @@ do_shrink() {
             die "GPT verification failed after shrink. Do not start the VM; inspect $LOGFILE."
         fi
         [[ -n "$NBD_DEV" ]] && { qemu-nbd -d "$NBD_DEV" >>"$LOGFILE" 2>&1 || true; NBD_DEV=""; }
+        [[ -n "$RBD_MAPPED" ]] && { rbd unmap "$RBD_MAPPED" >>"$LOGFILE" 2>&1 || true; RBD_MAPPED=""; }
     fi
 
     # 7.7 sync the guest config
@@ -1194,6 +1259,8 @@ main() {
         if d_yesno "$noun is running" "$noun $vmid is $status.\n\nThe volume must be offline to shrink it safely. Stop it now?"; then
             guest_stop "$vmid" >>"$LOGFILE" 2>&1 || die "Stopping $noun $vmid failed."
             for _ in $(seq 1 30); do [[ "$(guest_status "$vmid")" == stopped ]] && break; sleep 1; done
+            [[ "$(guest_status "$vmid")" == stopped ]] \
+                || die "$noun $vmid did not reach the 'stopped' state. Aborting; no shrink performed."
         else
             clear; exit 0
         fi
@@ -1302,6 +1369,7 @@ Mode:            reclaim trailing free space only (no filesystem/partition/LVM c
 
 Free after last partition: $(human "$TRAIL_FREE_BYTES")
 New device size: $(human "$NEW_DEV_BYTES")   (currently $(human $(( SECTORS * SECTOR_SIZE ))))
+Reclaimed:       $(human $(( SECTORS * SECTOR_SIZE - NEW_DEV_BYTES )))
 
 Steps: shrink $BACKEND -> fix GPT backup -> qm rescan
 EOF
@@ -1318,6 +1386,7 @@ Mode:            compact the volume group (pvmove + pvresize; no filesystem is t
 
 Used by the VG:  $(human "$PV_USED_BYTES")
 New device size: $(human "$NEW_DEV_BYTES")   (currently $(human $(( SECTORS * SECTOR_SIZE ))))
+Reclaimed:       $(human $(( SECTORS * SECTOR_SIZE - NEW_DEV_BYTES )))
 
 Steps: compact PV -> shrink partition $LAST_N -> shrink $BACKEND -> fix GPT backup -> qm rescan
 EOF
@@ -1340,6 +1409,7 @@ Layout:          $layout
 Data in use:     $(human "$MIN_FS_BYTES")
 New filesystem:  $(human "$NEW_FS_BYTES")
 New device size: $(human "$NEW_DEV_BYTES")   (currently $(human $(( SECTORS * SECTOR_SIZE ))))
+Reclaimed:       $(human $(( SECTORS * SECTOR_SIZE - NEW_DEV_BYTES )))
 
 Steps: $steps
 EOF
