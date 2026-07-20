@@ -68,18 +68,13 @@ Guest LVM (an LVM physical volume inside a VM disk) has three modes:
 - XFS cannot be shrunk. A plain XFS partition is refused. XFS inside an LVM volume group can
   still be reduced by the group's free space using the compact mode above, since the XFS
   filesystem itself is never touched.
-- BitLocker-encrypted partitions cannot be shrunk offline. The tool detects BitLocker and never
-  touches the volume; a hint explains the two options: (A) shrink it in Windows (Disk
-  Management is BitLocker-aware), then re-run this tool to reclaim the freed space at the device
-  level, or (B) turn BitLocker off in Windows (`manage-bde -off`), after which the volume is
-  plain NTFS and this tool can shrink it directly. Applies to any encrypted volume, not only C:.
-- MBR (msdos) partition tables are detected and refused with an actionable message (convert to
-  GPT, or use GParted). Nothing is touched. A whole disk with no partition table is fine.
-- NTFS must be cleanly shut down. If the volume is hibernated or Fast Startup is on, the tool
-  refuses. Boot Windows, disable Fast Startup, shut down fully, then retry.
-- Ceph/RBD is supported, but only with KRBD enabled on the storage, so the image is reachable as
-  a local `/dev/rbd` device. A volume served only through librbd has no local device; only that
-  case is refused, with a message telling you to enable KRBD and retry.
+- BitLocker (or any encrypted) volumes are detected and never touched. Shrink it in Windows
+  first, or turn BitLocker off there, then re-run this tool. Applies to any encrypted volume.
+- MBR (msdos) partition tables are refused (convert to GPT). A whole disk with no partition
+  table is fine.
+- NTFS must be cleanly shut down; a hibernated volume or Fast Startup is refused.
+- Ceph/RBD is supported only with KRBD enabled (so the image maps to `/dev/rbd`). A librbd-only
+  volume has no local device and is refused with a hint to enable KRBD.
 
 ## Requirements
 
@@ -114,54 +109,34 @@ Interactive flow:
    a choice between reclaiming only that free space, compacting, or shrinking a filesystem.
 8. Review the summary and confirm. Nothing is written before this confirmation.
 
-During the shrink a progress bar shows each step with a live elapsed second counter, so it is
-always visible that the tool is working and not hung.
-
 ## Safety model
 
-- The guest must be stopped. The volume is worked on offline.
-- You choose the volume explicitly. VM efidisk, tpmstate, cloudinit and CD drives are filtered
-  out and can never be picked.
-- The target can never be smaller than the data in use plus your chosen headroom, and can never
-  be larger than or equal to the current size.
-- Every value parsed from `sgdisk`, `resize2fs`, `lvm` and friends is read in the C locale, so a
-  localized host cannot mis-parse a size.
-- BitLocker-encrypted volumes are detected and never touched.
-- The original partition layout is written to the log before any write. The tool creates no
-  backup files.
-- For a partitioned disk the GPT is verified with `sgdisk -v` after the shrink. A failed check
-  stops the run and tells you not to start the guest.
-- Every destructive step needs an explicit confirmation, and a cleanup routine always detaches
-  nbd devices, partition mappings and activated volume groups on exit.
-- `--dry-run` shows exactly what would happen without touching anything.
+- The guest must be stopped; the volume is worked on offline. You pick the volume explicitly
+  (efidisk, tpmstate, cloudinit and CD drives are never listed).
+- The target can never be smaller than the data in use plus your chosen headroom, nor larger
+  than or equal to the current size.
+- Sizes are parsed in the C locale, so a localized host cannot mis-parse them.
+- The GPT is verified with `sgdisk -v` after the shrink; a failed check stops the run and tells
+  you not to start the guest.
+- Every destructive step needs explicit confirmation, and a cleanup routine always detaches nbd
+  devices, partition mappings and activated volume groups on exit. `--dry-run` changes nothing.
 
-This tool does not create a backup. Make sure a current backup of the guest exists before you
-use it.
-
-## First boot after a shrink
-
-The first boot after a shrink can be slower than usual and may print RCU or soft lockup warnings
-on the console while ext4 finishes its lazy inode table work in the background. This is expected
-and clears on its own.
+This tool creates no backup. Make sure a current backup of the guest exists before you use it.
 
 ## Recovery
 
-The tool creates no backup files. Before any change it writes the original partition layout
-(`sgdisk -p`) to the log, so the previous layout can always be read back and recreated by hand.
+The original partition layout (`sgdisk -p`) is written to the log before any change, so it can
+be read back and recreated by hand.
 
-If a run stops with a GPT verification error, do not start the guest. Read the original layout
-from the log and rebuild the backup header with `sgdisk -e <device>`, then verify with
-`sgdisk -v <device>`.
+If a run stops with a GPT verification error, do not start the guest: rebuild the backup header
+with `sgdisk -e <device>`, then verify with `sgdisk -v <device>`.
 
-If a guest ever drops to an initramfs or emergency shell asking for a manual filesystem check,
-run it by hand and boot on:
+If a guest drops to an emergency shell for a manual filesystem check, run `fsck -y /dev/<device>`
+and `exit` to boot on.
 
-```
-fsck -y /dev/<device>
-exit
-```
+The first boot after a shrink can be slower and may print RCU or lazy-inode warnings while ext4
+finishes in the background; this is expected.
 
 ## Logs
 
-All actions, including the original partition layout, are logged to
-`/var/log/pve-disk-shrink/pve-disk-shrink.log`.
+Everything is logged to `/var/log/pve-disk-shrink/pve-disk-shrink.log`.
