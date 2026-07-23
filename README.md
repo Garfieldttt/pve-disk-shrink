@@ -15,12 +15,12 @@ You pick a VM or a container, the disk or volume, and how much to reclaim. The t
 the offline sequence that fits the layout:
 
 - Check the filesystem first (`e2fsck` for ext, `ntfsresize --info` for NTFS). Errors are only
-  repaired after you confirm; a dirty or hibernated NTFS is refused.
+  repaired after you confirm, a dirty or hibernated NTFS is refused.
 - Shrink the filesystem where needed (`resize2fs` for ext2/3/4, `ntfsresize` for NTFS).
 - For a partitioned disk, shrink the chosen partition with `sgdisk`, preserving its start
   sector, type, name, unique GUID and GPT attribute flags, so `root=` / `/etc/fstab`, the
   Windows boot chain and a Windows Recovery partition keep working. Partitions that sit after
-  it are moved down into the freed space, keeping their order and identity; swap is recreated
+  it are moved down into the freed space, keeping their order and identity, swap is recreated
   with its original UUID.
 - Shrink the backing device: `zfs set volsize` (zvol), `qemu-img resize --shrink` (qcow2 or
   raw image), `rbd resize --allow-shrink` (Ceph/RBD), or `lvreduce` (LVM). For a ZFS subvol
@@ -31,7 +31,7 @@ the offline sequence that fits the layout:
   a CT).
 
 Volumes that hold a filesystem or an LVM physical volume directly on the device, with no
-partition table, are handled too; the partition and GPT steps are then skipped. This is the
+partition table, are handled too, the partition and GPT steps are then skipped. This is the
 normal case for containers.
 
 ## Supported
@@ -72,7 +72,7 @@ Guest LVM (an LVM physical volume inside a VM disk) has three modes:
   first, or turn BitLocker off there, then re-run this tool. Applies to any encrypted volume.
 - MBR (msdos) partition tables are refused (convert to GPT). A whole disk with no partition
   table is fine.
-- NTFS must be cleanly shut down; a hibernated volume or Fast Startup is refused.
+- NTFS must be cleanly shut down, a hibernated volume or Fast Startup is refused.
 - Ceph/RBD is supported only with KRBD enabled (so the image maps to `/dev/rbd`). A librbd-only
   volume has no local device and is refused with a hint to enable KRBD.
 
@@ -81,7 +81,7 @@ Guest LVM (an LVM physical volume inside a VM disk) has three modes:
 Run it as root on a Proxmox VE node. It uses tools that ship with PVE: `qm`, `pct`, `pvesm`,
 `sgdisk`, `e2fsck`, `resize2fs`, `qemu-nbd`, `qemu-img`, `blkid`, `lsblk`, `partx`, `zfs`,
 `dialog`, `numfmt`. LVM needs `lvm2`. NTFS needs `ntfs-3g` and a raw-LV backed disk needs
-`kpartx`; the tool offers to install these when needed. A Ceph/RBD disk needs `rbd`
+`kpartx`, the tool offers to install these when needed. A Ceph/RBD disk needs `rbd`
 (ceph-common), which is already present on any PVE node that serves RBD storage.
 
 ## Usage
@@ -97,7 +97,7 @@ Interactive flow:
 1. Pick the VM or container.
 2. Pick the disk or volume. VM efidisk, tpmstate, cloudinit and CD drives are never listed. For
    a VM the boot disk is marked `[boot]`.
-3. For a partitioned VM disk, pick the partition to shrink; partitions after it are moved down.
+3. For a partitioned VM disk, pick the partition to shrink, partitions after it are moved down.
    This step is skipped for a whole-disk filesystem or a container volume.
 4. If the guest is running you are asked to stop it.
 5. If it has snapshots you are warned that all of them will be deleted permanently, and asked to
@@ -111,12 +111,12 @@ Interactive flow:
 
 ## Safety model
 
-- The guest must be stopped; the volume is worked on offline. You pick the volume explicitly
+- The guest must be stopped, the volume is worked on offline. You pick the volume explicitly
   (efidisk, tpmstate, cloudinit and CD drives are never listed).
 - The target can never be smaller than the data in use plus your chosen headroom, nor larger
   than or equal to the current size.
 - Sizes are parsed in the C locale, so a localized host cannot mis-parse them.
-- The GPT is verified with `sgdisk -v` after the shrink; a failed check stops the run and tells
+- The GPT is verified with `sgdisk -v` after the shrink, a failed check stops the run and tells
   you not to start the guest.
 - Every destructive step needs explicit confirmation, and a cleanup routine always detaches nbd
   devices, partition mappings and activated volume groups on exit. `--dry-run` changes nothing.
@@ -135,7 +135,7 @@ If a guest drops to an emergency shell for a manual filesystem check, run `fsck 
 and `exit` to boot on.
 
 The first boot after a shrink can be slower and may print RCU or lazy-inode warnings while ext4
-finishes in the background; this is expected.
+finishes in the background, this is expected.
 
 ## Logs
 
