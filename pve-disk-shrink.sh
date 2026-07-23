@@ -3,8 +3,8 @@
 #
 # Performs the complete shrink without GParted: resize the filesystem (ext2/3/4, NTFS
 # or guest LVM), shrink the chosen partition (preserving its GUIDs), move any partitions
-# after it down (order kept), shrink the backing block device (ZFS zvol / qcow2 / raw LV),
-# fix the GPT backup header, and sync the VM config. Auto-discovers the storage backend
+# after it down (order kept), shrink the backing block device (ZFS zvol / qcow2 / raw image /
+# raw LV), fix the GPT backup header, and sync the VM config. Auto-discovers the storage backend
 # and partition layout, lets you pick the disk and partition, and refuses to make the
 # disk smaller than the data plus a chosen headroom.
 #
@@ -28,7 +28,7 @@ export LC_ALL=C LANG=C
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.4.0"
+VERSION="1.4.1"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -355,7 +355,7 @@ select_partition() {
 # ---------------------------------------------------------------------------
 # Discover backend for a chosen disk key
 # ---------------------------------------------------------------------------
-# Sets: DISK_KEY DISK_VOL DISK_PATH BACKEND (zvol|qcow2|rawlv) ZVOL VOLBLK CFG_SIZE
+# Sets: DISK_KEY DISK_VOL DISK_PATH BACKEND (zvol|qcow2|rbd|rawimg|rawlv) ZVOL VOLBLK CFG_SIZE
 discover_disk() {
     local vmid=$1 diskkey=$2 cfg
     cfg=$(qm config "$vmid")
@@ -382,6 +382,10 @@ discover_disk() {
         command -v rbd >/dev/null || die "rbd CLI (ceph-common) is required for the Ceph/RBD backend."
     elif [[ "$DISK_PATH" == rbd:* ]]; then
         die "This RBD volume is accessed through librbd (no local device). Enable 'KRBD' on the storage so it maps to /dev/rbd, then retry."
+    elif [[ -f "$DISK_PATH" ]]; then
+        # Raw image file on a directory storage (qemu-img format 'raw'; the qcow2 branch above
+        # did not match). Attach it via qemu-nbd like a qcow2 image, but resize with -f raw.
+        BACKEND=rawimg
     elif [[ -b "$DISK_PATH" ]]; then
         BACKEND=rawlv
     else
@@ -448,16 +452,17 @@ attach_disk() {
             # Container volume: a filesystem sits directly on the file/LV, no partition table.
             BASE=$DISK_PATH
             ;;
-        qcow2)
+        qcow2|rawimg)
             modprobe nbd max_part=16 2>>"$LOGFILE" || true
-            local n
+            local n fmt=qcow2
+            [[ "$BACKEND" == rawimg ]] && fmt=raw
             for n in $(seq 0 15); do
                 [[ -e "/sys/block/nbd$n/pid" ]] && continue
-                if qemu-nbd -c "/dev/nbd$n" "$DISK_PATH" >>"$LOGFILE" 2>&1; then
+                if qemu-nbd -f "$fmt" -c "/dev/nbd$n" "$DISK_PATH" >>"$LOGFILE" 2>&1; then
                     NBD_DEV="/dev/nbd$n"; break
                 fi
             done
-            [[ -n "$NBD_DEV" ]] || die "No free nbd device to attach the qcow2 image."
+            [[ -n "$NBD_DEV" ]] || die "No free nbd device to attach the image."
             BASE=$NBD_DEV
             ;;
     esac
@@ -471,7 +476,7 @@ partdev() {
     local n=$1
     case "$BACKEND" in
         zvol)  echo "${BASE}-part${n}" ;;
-        qcow2) echo "${BASE}p${n}" ;;
+        qcow2|rawimg) echo "${BASE}p${n}" ;;
         rbd)   echo "${BASE}p${n}" ;;
         rawlv) [[ -e "${BASE}p${n}" ]] && echo "${BASE}p${n}" || echo "${BASE}${n}" ;;
     esac
@@ -1106,7 +1111,7 @@ do_shrink() {
             ( rbd resize --allow-shrink --size "$(( NEW_DEV_BYTES / MIB ))" "$RBD_SPEC" >>"$LOGFILE" 2>&1 ) &
             gauge_wait $! 70 90 "Shrinking RBD image" || die "rbd resize failed."
             ;;
-        rawfile)
+        rawfile|rawimg)
             log "qemu-img resize --shrink -f raw $DISK_PATH ${NEW_DEV_BYTES}"
             ( qemu-img resize --shrink -f raw "$DISK_PATH" "${NEW_DEV_BYTES}" >>"$LOGFILE" 2>&1 ) &
             gauge_wait $! 70 90 "Shrinking image file" || die "qemu-img resize failed."
@@ -1137,12 +1142,13 @@ do_shrink() {
                 RBD_MAPPED=$RBD_SPEC
                 vbase=$BASE
                 ;;
-            qcow2)
+            qcow2|rawimg)
                 modprobe nbd max_part=16 2>>"$LOGFILE" || true
-                local n
+                local n fmt=qcow2
+                [[ "$BACKEND" == rawimg ]] && fmt=raw
                 for n in $(seq 0 15); do
                     [[ -e "/sys/block/nbd$n/pid" ]] && continue
-                    if qemu-nbd -c "/dev/nbd$n" "$DISK_PATH" >>"$LOGFILE" 2>&1; then NBD_DEV="/dev/nbd$n"; break; fi
+                    if qemu-nbd -f "$fmt" -c "/dev/nbd$n" "$DISK_PATH" >>"$LOGFILE" 2>&1; then NBD_DEV="/dev/nbd$n"; break; fi
                 done
                 vbase=$NBD_DEV
                 ;;
