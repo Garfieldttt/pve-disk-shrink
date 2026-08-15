@@ -28,7 +28,7 @@ export LC_ALL=C LANG=C
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.4.1"
+VERSION="1.4.2"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -180,13 +180,44 @@ gauge_wait() {
 # Size helpers (work in bytes; align / round conservatively)
 # ---------------------------------------------------------------------------
 MIB=$((1024*1024))
-human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
+# Sizes here are binary throughout, and so is Proxmox's "G" in qm config / the GUI, so label
+# them GiB/MiB rather than the GB/MB that --to=iec prints for the same 1024-based values.
+human() { numfmt --to=iec-i --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
 roundup() { local v=$1 a=$2; echo $(( (v + a - 1) / a * a )); }   # round v up to multiple of a
 
-# ",  frees ~<X>" for a target-size menu row: how much the host reclaims if the filesystem
-# ends up at <fs> bytes. Only shown when the current disk size is known (have_cur=1) and the
-# choice actually shrinks. It is an estimate (ignores GPT/trailing/alignment overhead), hence "~".
-freehint() { local hc=$1 cur=$2 fs=$3; [[ "$hc" == 1 ]] || return 0; (( cur > fs )) && printf ',  frees ~%s' "$(human $(( cur - fs )))"; }
+# Device size (bytes) a target filesystem size of $1 would produce, obtained by running the
+# real planner in a subshell. Everything it sets (NEW_DEV_BYTES, NEW_LAST_END, TRAIL_NEW, ...)
+# dies with that subshell, and LOGFILE is muted, so this is side-effect free and the menu can
+# never disagree with the plan do_shrink executes. Echoes nothing if the planner fails.
+plan_preview_dev() {
+    local fs=$1
+    (
+        LOGFILE=/dev/null
+        if (( ${GUEST_LVM:-0} == 1 )); then
+            NEW_FS_BYTES=$(roundup "$fs" "$MIB")
+            plan_lvm "$(( PV_USED_BYTES - (LV_TARGET_CUR - NEW_FS_BYTES) ))"
+        else
+            plan_sizes "$fs"
+        fi
+        echo "$NEW_DEV_BYTES"
+    ) 2>/dev/null
+}
+
+# ",  disk <X>, frees <Y>" for a target-size menu row. Unlike the filesystem size, this is what
+# the host actually gets back: the partition start offset, any partitions moved down behind it,
+# GPT reserve, alignment and backend granularity are all accounted for, because the numbers come
+# straight from the planner. Rows that would not shrink the disk say so instead of a fake gain.
+freehint() {
+    local hc=$1 cur=$2 fs=$3 dev
+    [[ "$hc" == 1 ]] || return 0
+    dev=$(plan_preview_dev "$fs")
+    [[ "$dev" =~ ^[0-9]+$ ]] || return 0
+    if (( dev < cur )); then
+        printf ',  disk %s, frees %s' "$(human "$dev")" "$(human $(( cur - dev )))"
+    else
+        printf ',  disk %s, no gain' "$(human "$dev")"
+    fi
+}
 
 # Ensure a command is available, offering to install its package first. Always asks
 # before installing anything; dies if the user declines or the install fails.
@@ -928,7 +959,10 @@ ask_target() {
     mtext+="Data in use:  $(human "$floor")   (the smallest the filesystem can be)\n\n"
     mtext+="Each option keeps that much room above the data. More room means more free\n"
     mtext+="space left inside the VM but less reclaimed on the host; less room reclaims\n"
-    mtext+="more now but leaves the disk tighter. It never goes below the data size."
+    mtext+="more now but leaves the disk tighter. It never goes below the data size.\n\n"
+    mtext+="'disk' is the size this volume ends up at and 'frees' what the host gets back.\n"
+    mtext+="Both are smaller than the filesystem change suggests, because everything in\n"
+    mtext+="front of this filesystem and any partition behind it stays on the disk."
     while true; do
         local f10=$(( floor*110/100 )) f20=$(( floor*120/100 )) f30=$(( floor*130/100 )) f40=$(( floor*140/100 )) f50=$(( floor*150/100 ))
         choice=$(d_menu "Target size" "$mtext" 8 \
@@ -939,12 +973,20 @@ ask_target() {
             50 "data +50%  ->  fs $(human "$f50")$(freehint "$have_cur" "$cur" "$f50")" \
             manual "enter a size by hand (e.g. 12G)") || return 1
         if [[ "$choice" == manual ]]; then
-            local v bytes
-            v=$(d_input "Manual size" "Enter the target filesystem size, e.g. 12G or 8000M.\nMust be at least the data minimum ($(human "$floor")).\nThe disk ends up about this size plus a little overhead." "") || continue
+            local v bytes dev
+            v=$(d_input "Manual size" "Enter the target filesystem size, e.g. 12G or 8000M.\nMust be at least the data minimum ($(human "$floor")).\nThe disk itself ends up larger: whatever sits in front of this filesystem\nand any partition behind it is added on top." "") || continue
             bytes=$(numfmt --from=iec "${v//B/}" 2>/dev/null) || { d_msg "Invalid" "Could not parse '$v'."; continue; }
             if (( bytes < floor )); then
                 d_msg "Too small" "Requested $(human "$bytes") is below the data minimum $(human "$floor"). Choose a larger size."
                 continue
+            fi
+            # Say so here rather than letting the "never grow" guard end the run later.
+            if (( have_cur )); then
+                dev=$(plan_preview_dev "$bytes")
+                if [[ "$dev" =~ ^[0-9]+$ ]] && (( dev >= cur )); then
+                    d_msg "No gain" "A filesystem of $(human "$bytes") puts the disk at $(human "$dev"), which is not smaller than its current $(human "$cur").\n\nChoose a smaller size."
+                    continue
+                fi
             fi
             CHOSEN_FS_BYTES=$bytes; return 0
         else
