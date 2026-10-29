@@ -80,8 +80,8 @@ Guest LVM (an LVM physical volume inside a VM disk) has three modes:
 
 Run it as root on a Proxmox VE node. It uses tools that ship with PVE: `qm`, `pct`, `pvesm`,
 `sgdisk`, `e2fsck`, `resize2fs`, `qemu-nbd`, `qemu-img`, `blkid`, `lsblk`, `partx`, `zfs`,
-`dialog`, `numfmt`. LVM needs `lvm2`. NTFS needs `ntfs-3g` and a raw-LV backed disk needs
-`kpartx`, the tool offers to install these when needed. A Ceph/RBD disk needs `rbd`
+`dialog`, `numfmt`. LVM needs `lvm2`. NTFS needs `ntfs-3g`; the tool offers to install it when
+needed. A Ceph/RBD disk needs `rbd`
 (ceph-common), which is already present on any PVE node that serves RBD storage.
 
 ## Usage

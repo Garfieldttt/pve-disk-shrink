@@ -14,11 +14,11 @@
 #   pve-disk-shrink.sh --debug         verbose trace to the logfile
 #
 # Requires: root on a Proxmox VE node. Tools: sgdisk, e2fsck, resize2fs, qemu-nbd,
-#           qemu-img, blkid, lsblk, partx, zfs, dialog (plus lvm2 / kpartx when needed).
+#           qemu-img, blkid, lsblk, partx, zfs, dialog (plus lvm2 / ntfs-3g when needed).
 #
 # Author: Garfieldttt (Thomas Rzen)
 
-set -euo pipefail
+set -Eeuo pipefail   # -E: the ERR trap also fires inside functions (do_shrink and friends)
 
 # Every size and geometry value below is parsed from the English output of sgdisk,
 # resize2fs, dumpe2fs, ntfsresize and lvm. Force the C locale so a localized host cannot
@@ -28,7 +28,7 @@ export LC_ALL=C LANG=C
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.4.2"
+VERSION="1.4.3"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -43,6 +43,8 @@ RBD_SPEC=""           # <pool>[/<namespace>]/<image> for a Ceph/RBD backend
 RBD_MAPPED=""         # RBD spec we mapped ourselves and must "rbd unmap"
 PARTX_BASE=""         # base device we ran "partx -a" against
 ACTIVE_VG=""          # guest volume group we activated and must deactivate
+GUEST_VG=""           # name of the guest volume group (also when it is not activated)
+LVM_NAME_CLASH=0      # 1 when the guest VG name is also used by a host VG
 LVM_CFG=()            # scoped LVM options (permissive filter + our device only)
 PV_TARGET_BYTES=0     # size to shrink a guest PV to (filesystem plus metadata margin)
 PROTECTION_VMID=""    # VM whose protection flag we disabled and must re-enable
@@ -69,6 +71,9 @@ die() {
 
 _on_error() {
     local rc=$? line=$BASH_LINENO cmd=$BASH_COMMAND
+    # Subshells (command substitutions, background steps) report through their exit status,
+    # which the caller checks; only failures in the main shell are fatal here.
+    (( BASH_SUBSHELL == 0 )) || return 0
     # dialog cancel/ESC returns non-zero and is handled explicitly, not an error here
     [[ "$cmd" == *"dialog "* ]] && return
     log "ERR line $line rc $rc cmd: $cmd"
@@ -102,6 +107,7 @@ cleanup() {
         PARTX_BASE=""
     fi
     if [[ -n "$NBD_DEV" ]]; then
+        release_holders "$NBD_DEV"
         qemu-nbd -d "$NBD_DEV" >>"$LOGFILE" 2>&1 || true
         NBD_DEV=""
     fi
@@ -112,6 +118,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The host's udev rules auto-activate a guest volume group as soon as its PV shows up on an
+# nbd device. Remove every device-mapper device stacked on our nbd device (and its
+# partitions), innermost holders first, so nothing stays mapped onto a detached nbd that is
+# later reused for another image.
+_rm_holders() {
+    local blk=$1 h n
+    for h in /sys/class/block/"$blk"/holders/*; do
+        [[ -e "$h" ]] || continue
+        n=${h##*/}
+        _rm_holders "$n"
+        [[ -r "/sys/class/block/$n/dm/name" ]] || continue
+        dmsetup remove "$(cat "/sys/class/block/$n/dm/name")" >>"$LOGFILE" 2>&1 \
+            || log "warning: could not remove device-mapper device $n on $blk"
+    done
+}
+release_holders() {
+    local d=${1#/dev/} p
+    _rm_holders "$d"
+    for p in /sys/class/block/"$d"/"$d"p*; do
+        [[ -e "$p" ]] && _rm_holders "${p##*/}"
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # dialog wrappers (each swallows the cancel exit code; return 1 on cancel)
 # ---------------------------------------------------------------------------
@@ -121,14 +151,14 @@ d_yesno(){ dialog --backtitle "$BACKTITLE" --title "$1" --yesno "$2" "${3:-14}" 
 d_menu() { # title text menuheight tag item tag item ...  -> echoes chosen tag
     local title=$1 text=$2 h=$3; shift 3
     local out rc
-    out=$(dialog --backtitle "$BACKTITLE" --title "$title" --menu "$text" $((h+8)) 78 "$h" "$@" 3>&1 1>&2 2>&3) || rc=$?
+    out=$(dialog --backtitle "$BACKTITLE" --title "$title" --menu "$text" $((h+8)) 78 "$h" "$@" 3>&1 1>/dev/tty 2>&3) || rc=$?
     [[ ${rc:-0} -ne 0 ]] && return 1
     printf '%s' "$out"
 }
 
 d_input() { # title text default -> echoes entered value
     local out rc
-    out=$(dialog --backtitle "$BACKTITLE" --title "$1" --inputbox "$2" 10 72 "${3:-}" 3>&1 1>&2 2>&3) || rc=$?
+    out=$(dialog --backtitle "$BACKTITLE" --title "$1" --inputbox "$2" 10 72 "${3:-}" 3>&1 1>/dev/tty 2>&3) || rc=$?
     [[ ${rc:-0} -ne 0 ]] && return 1
     printf '%s' "$out"
 }
@@ -301,6 +331,7 @@ list_disks() {
         [[ "$rest" == none* || "$rest" == *cloudinit* ]] && continue
         vol=${rest%%,*}
         [[ -n "$vol" && "$vol" != *.iso ]] || continue
+        [[ "$vol" == /* ]] && continue   # passed-through host disk (/dev/disk/by-id/...), not a PVE volume
         size=$(sed -n 's/.*size=\([0-9A-Za-z.]*\).*/\1/p' <<<"$rest")
         printf '%s\t%s\t%s\n' "$key" "$vol" "${size:-?}"
     done < <(qm config "$vmid")
@@ -372,7 +403,7 @@ select_partition() {
         done
         sel=$(dialog --backtitle "$BACKTITLE" --title "Select partition on $DISK_KEY" --default-item "$LAST_N" \
             --menu "Pick the partition to shrink. Partitions after it keep their order and are moved down." \
-            20 82 12 "${args[@]}" 3>&1 1>&2 2>&3) || { detach_disk; clear; exit 0; }
+            20 82 12 "${args[@]}" 3>&1 1>/dev/tty 2>&3) || { detach_disk; clear; exit 0; }
         for line in "${ALL_PARTS[@]}"; do IFS=$'\t' read -r n s e fs <<<"$line"; [[ "$n" == "$sel" ]] && selfs=$fs; done
         if fs_shrinkable "$selfs"; then choose_partition "$sel"; return 0; fi
         if [[ "$selfs" == BitLocker ]]; then
@@ -416,8 +447,15 @@ discover_disk() {
     elif [[ -f "$DISK_PATH" ]]; then
         # Raw image file on a directory storage (qemu-img format 'raw'; the qcow2 branch above
         # did not match). Attach it via qemu-nbd like a qcow2 image, but resize with -f raw.
+        # Any other image format (vmdk, ...) would be treated as raw bytes and truncated.
+        qemu-img info --output=json "$DISK_PATH" 2>/dev/null | grep -q '"format": "raw"' \
+            || die "Unsupported image format for $DISK_PATH (only qcow2 and raw image files are supported). Nothing was changed."
         BACKEND=rawimg
-    elif [[ -b "$DISK_PATH" ]]; then
+    elif [[ -b "$DISK_PATH" ]] || lvs "$DISK_PATH" >/dev/null 2>&1; then
+        # LVM / LVM-thin volume (local-lvm). The device is shrunk with lvreduce, so anything
+        # that is not an LV (a raw iSCSI LUN, ...) is refused before it is touched.
+        lvs "$DISK_PATH" >/dev/null 2>&1 \
+            || die "$DISK_PATH is a block device but not an LVM volume. This tool cannot shrink it. Nothing was changed."
         BACKEND=rawlv
     else
         die "Unsupported disk path: $DISK_PATH"
@@ -464,12 +502,6 @@ attach_disk() {
             partx -a "$BASE" >>"$LOGFILE" 2>&1 || true
             PARTX_BASE=$BASE
             ;;
-        rawlv)
-            ensure_pkg kpartx kpartx "The raw-LV storage backend"
-            BASE=$DISK_PATH
-            partx -a "$BASE" >>"$LOGFILE" 2>&1 || true
-            PARTX_BASE=$BASE
-            ;;
         rbd)
             # The image is unmapped while the guest is stopped, so map it now. KRBD exposes
             # partitions as /dev/rbdNpM on its own; partx -a is a harmless belt-and-braces.
@@ -483,10 +515,16 @@ attach_disk() {
             # Container volume: a filesystem sits directly on the file/LV, no partition table.
             BASE=$DISK_PATH
             ;;
-        qcow2|rawimg)
+        qcow2|rawimg|rawlv)
+            # A logical volume is a device-mapper device, which the kernel never partition-scans
+            # (partx -a cannot add children to it), so it is exported through qemu-nbd as raw too.
+            # PVE deactivates LVs of a stopped guest; activate it first.
+            if [[ "$BACKEND" == rawlv && ! -b "$DISK_PATH" ]]; then
+                lvchange -ay "$DISK_PATH" >>"$LOGFILE" 2>&1 || die "Could not activate $DISK_PATH."
+            fi
             modprobe nbd max_part=16 2>>"$LOGFILE" || true
             local n fmt=qcow2
-            [[ "$BACKEND" == rawimg ]] && fmt=raw
+            [[ "$BACKEND" != qcow2 ]] && fmt=raw
             for n in $(seq 0 15); do
                 [[ -e "/sys/block/nbd$n/pid" ]] && continue
                 if qemu-nbd -f "$fmt" -c "/dev/nbd$n" "$DISK_PATH" >>"$LOGFILE" 2>&1; then
@@ -499,6 +537,9 @@ attach_disk() {
     esac
     udevadm settle 2>/dev/null || true
     sleep 1
+    # drop any guest LVs the host auto-activated on the fresh nbd device (lvm_prepare
+    # activates the guest VG itself, scoped, when it is actually needed)
+    if [[ -n "$NBD_DEV" ]]; then release_holders "$NBD_DEV"; fi
     log "attach backend=$BACKEND base=$BASE nbd=${NBD_DEV:-none}"
 }
 
@@ -507,9 +548,8 @@ partdev() {
     local n=$1
     case "$BACKEND" in
         zvol)  echo "${BASE}-part${n}" ;;
-        qcow2|rawimg) echo "${BASE}p${n}" ;;
+        qcow2|rawimg|rawlv) echo "${BASE}p${n}" ;;
         rbd)   echo "${BASE}p${n}" ;;
-        rawlv) [[ -e "${BASE}p${n}" ]] && echo "${BASE}p${n}" || echo "${BASE}${n}" ;;
     esac
 }
 
@@ -716,8 +756,27 @@ lvm_prepare() {
     GUEST_PV=$LAST_DEV
     local pvreal; pvreal=$(readlink -f "$GUEST_PV")
     LVM_CFG=(--config 'devices/global_filter=["a|.*|"] global/use_lvmpolld=0' --devices "$pvreal")
-    ACTIVE_VG=$(pvs "${LVM_CFG[@]}" --noheadings -o vg_name "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
-    [[ -n "$ACTIVE_VG" ]] || die "Could not find a volume group on $GUEST_PV."
+    local guuid clash
+    GUEST_VG=$(pvs "${LVM_CFG[@]}" --noheadings -o vg_name "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
+    guuid=$(pvs "${LVM_CFG[@]}" --noheadings -o vg_uuid "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
+    [[ -n "$GUEST_VG" && -n "$guuid" ]] || die "Could not find a volume group on $GUEST_PV."
+    # A guest VG with the same name as a host VG (e.g. both "vg0", or "pve" in a nested PVE)
+    # must never be activated: its LVs would collide with the host's /dev/<vg>/<lv> and
+    # device-mapper names, so every later path would address the HOST volumes. Only the
+    # trailing free space can then be reclaimed, which needs no activation at all.
+    clash=$(vgs --noheadings -o vg_name,vg_uuid 2>/dev/null | awk -v n="$GUEST_VG" -v u="$guuid" '$1==n && $2!=u')
+    if [[ -n "$clash" ]]; then
+        log "lvm_prepare: guest VG '$GUEST_VG' ($guuid) has the same name as a host VG; not activating"
+        LVM_NAME_CLASH=1; LVM_FS_LIST="not inspected (name clash with the host)"
+        local why="The volume group inside this disk is named '$GUEST_VG', the same as a volume group on this host. It cannot be activated here without colliding with the host's volumes, so LVM inside the disk is left untouched."
+        if [[ ${NO_GPT:-0} -eq 0 ]] && (( TRAIL_FREE_BYTES >= 1024*MIB )); then
+            d_msg "Volume group name clash" "$why\n\nOnly the $(human "$TRAIL_FREE_BYTES") of free space after the LVM partition can be reclaimed." 14 76
+            SHRINK_MODE=trailing
+            return 0
+        fi
+        die "$why\n\nThere is no free space after the LVM partition to reclaim either. Nothing was changed."
+    fi
+    ACTIVE_VG=$GUEST_VG
     vgchange "${LVM_CFG[@]}" -ay "$ACTIVE_VG" >>"$LOGFILE" 2>&1 || die "Could not activate guest VG $ACTIVE_VG."
     PV_EXTENT=$(vgs "${LVM_CFG[@]}" --noheadings --units b --nosuffix -o vg_extent_size "$ACTIVE_VG" 2>>"$LOGFILE" | tr -d ' ')
     PV_PESTART=$(pvs "${LVM_CFG[@]}" --noheadings --units b --nosuffix -o pe_start "$GUEST_PV" 2>>"$LOGFILE" | tr -d ' ')
@@ -875,7 +934,7 @@ place_trailing() {
     NEW_DEV_BYTES=$dev_bytes
 }
 
-# Free space (bytes) after the physically-last partition — reclaimable by simply cutting
+# Free space (bytes) after the physically-last partition: reclaimable by simply cutting
 # the device down to that partition's end, touching no filesystem, partition or LVM.
 # Sets DISK_LAST_END (sector) and TRAIL_FREE_BYTES.
 compute_trailing_free() {
@@ -1141,7 +1200,7 @@ do_shrink() {
             ( zfs set volsize="${NEW_DEV_BYTES}" "$ZVOL" >>"$LOGFILE" 2>&1 ) &
             gauge_wait $! 70 90 "Shrinking zvol" || die "zfs set volsize failed."
             ;;
-        qcow2|rawlv)
+        qcow2)
             log "qemu-img resize --shrink $DISK_PATH ${NEW_DEV_BYTES}"
             ( qemu-img resize --shrink "$DISK_PATH" "${NEW_DEV_BYTES}" >>"$LOGFILE" 2>&1 ) &
             gauge_wait $! 70 90 "Shrinking $BACKEND image" || die "qemu-img resize failed."
@@ -1158,17 +1217,26 @@ do_shrink() {
             ( qemu-img resize --shrink -f raw "$DISK_PATH" "${NEW_DEV_BYTES}" >>"$LOGFILE" 2>&1 ) &
             gauge_wait $! 70 90 "Shrinking image file" || die "qemu-img resize failed."
             ;;
-        ctlvm)
-            # lvreduce rounds to whole extents; round the target UP to the extent size so the
-            # logical volume can never end up smaller than the filesystem just resized into it.
-            local ctvg ctext ctdev
+        ctlvm|rawlv)
+            # qemu-img cannot shrink a block device ("Cannot resize device files"), so an LV is
+            # always reduced with lvreduce. lvreduce rounds to whole extents; round the target UP
+            # to the extent size so the logical volume can never end up smaller than the
+            # filesystem just resized into it.
+            local ctvg ctext ctdev ctcur
             ctvg=$(lvs --noheadings -o vg_name "$DISK_PATH" 2>>"$LOGFILE" | tr -d ' ')
             ctext=$(vgs --noheadings --units b --nosuffix -o vg_extent_size "$ctvg" 2>>"$LOGFILE" | tr -d ' ')
+            ctcur=$(lvs --noheadings --units b --nosuffix -o lv_size "$DISK_PATH" 2>>"$LOGFILE" | tr -d ' ')
             [[ "$ctext" =~ ^[0-9]+$ ]] || ctext=$(( 4 * MIB ))
             ctdev=$(( (NEW_DEV_BYTES + ctext - 1) / ctext * ctext ))
-            log "lvreduce -f -L ${ctdev}b $DISK_PATH (vg=$ctvg extent=$ctext)"
-            ( lvreduce -f -L "${ctdev}b" "$DISK_PATH" >>"$LOGFILE" 2>&1 ) &
-            gauge_wait $! 70 90 "Shrinking logical volume" || die "lvreduce failed."
+            if [[ "$ctcur" =~ ^[0-9]+$ ]] && (( ctdev >= ctcur )); then
+                # extent rounding left nothing to cut; lvreduce would refuse an equal size
+                log "lvreduce skipped: target ${ctdev}b not below current ${ctcur}b"
+                ctdev=$ctcur
+            else
+                log "lvreduce -f -L ${ctdev}b $DISK_PATH (vg=$ctvg extent=$ctext)"
+                ( lvreduce -f -L "${ctdev}b" "$DISK_PATH" >>"$LOGFILE" 2>&1 ) &
+                gauge_wait $! 70 90 "Shrinking logical volume" || die "lvreduce failed."
+            fi
             NEW_DEV_BYTES=$ctdev
             ;;
     esac
@@ -1202,7 +1270,7 @@ do_shrink() {
         if ! sgdisk -v "$vbase" >>"$LOGFILE" 2>&1; then
             die "GPT verification failed after shrink. Do not start the VM; inspect $LOGFILE."
         fi
-        [[ -n "$NBD_DEV" ]] && { qemu-nbd -d "$NBD_DEV" >>"$LOGFILE" 2>&1 || true; NBD_DEV=""; }
+        [[ -n "$NBD_DEV" ]] && { release_holders "$NBD_DEV"; qemu-nbd -d "$NBD_DEV" >>"$LOGFILE" 2>&1 || true; NBD_DEV=""; }
         [[ -n "$RBD_MAPPED" ]] && { rbd unmap "$RBD_MAPPED" >>"$LOGFILE" 2>&1 || true; RBD_MAPPED=""; }
     fi
 
@@ -1317,7 +1385,11 @@ main() {
     snapnames=$(list_snapshots "$vmid")
     if [[ -n "$snapnames" ]]; then
         cnt=$(grep -c . <<<"$snapnames")
-        if d_yesno "Snapshots present" "$noun $vmid has $cnt snapshot(s):\n\n$snapnames\n\nSnapshots block a shrink and cannot be kept. If you continue, ALL of these snapshots will be DELETED PERMANENTLY (this cannot be undone).\n\nDelete all snapshots and continue?" 20 74; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            # A dry run changes nothing: only report what a real run would delete.
+            d_msg "Snapshots present (dry run)" "$noun $vmid has $cnt snapshot(s):\n\n$snapnames\n\nA real run deletes ALL of them before shrinking. The dry run keeps them." 18 74
+            log "dry-run: $cnt snapshot(s) would be deleted on $GUEST_TYPE=$vmid"
+        elif d_yesno "Snapshots present" "$noun $vmid has $cnt snapshot(s):\n\n$snapnames\n\nSnapshots block a shrink and cannot be kept. If you continue, ALL of these snapshots will be DELETED PERMANENTLY (this cannot be undone).\n\nDelete all snapshots and continue?" 20 74; then
             # delete leaf-first (reverse of the listed root->child order)
             local s
             while read -r s; do
@@ -1330,7 +1402,7 @@ main() {
             clear; exit 0
         fi
     fi
-    if grep -q '^protection: 1' <(guest_config "$vmid"); then
+    if [[ $DRY_RUN -eq 0 ]] && grep -q '^protection: 1' <(guest_config "$vmid"); then
         if d_yesno "Protection enabled" "$noun $vmid has protection=1.\n\nDisable it for the shrink and re-enable it automatically at the end (also on cancel or error)?"; then
             guest_setprot "$vmid" 0 >>"$LOGFILE" 2>&1 || die "Could not disable protection."
             PROTECTION_VMID=$vmid
@@ -1360,8 +1432,9 @@ main() {
     # everything else picks between trailing-only and shrinking the partition's filesystem.
     # Prefer the safe path: reclaim free space without touching a filesystem whenever possible.
     if [[ $GUEST_LVM -eq 1 ]]; then
+        LVM_NAME_CLASH=0
         lvm_prepare
-        ask_lvm_mode || { detach_disk; clear; exit 0; }
+        (( LVM_NAME_CLASH )) || ask_lvm_mode || { detach_disk; clear; exit 0; }
     else
         SHRINK_MODE=partition
         if (( TRAIL_FREE_BYTES >= 1024*MIB )); then
@@ -1399,7 +1472,7 @@ main() {
     if [[ ${NO_GPT:-0} -eq 1 ]]; then
         layout="whole-disk $LAST_FS (no partition table)"
     elif [[ $GUEST_LVM -eq 1 ]]; then
-        layout="LVM on GPT (VG $ACTIVE_VG: ${LVM_FS_LIST% })"
+        layout="LVM on GPT (VG $GUEST_VG: ${LVM_FS_LIST% })"
     else
         layout="$LAST_FS, partition $LAST_N"
     fi
