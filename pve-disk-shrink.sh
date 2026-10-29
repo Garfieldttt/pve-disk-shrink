@@ -28,7 +28,7 @@ export LC_ALL=C LANG=C
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="1.4.3"
+VERSION="1.4.4"
 DRY_RUN=0
 DEBUG=0
 LOGDIR="/var/log/pve-disk-shrink"
@@ -151,7 +151,12 @@ d_yesno(){ dialog --backtitle "$BACKTITLE" --title "$1" --yesno "$2" "${3:-14}" 
 d_menu() { # title text menuheight tag item tag item ...  -> echoes chosen tag
     local title=$1 text=$2 h=$3; shift 3
     local out rc
-    out=$(dialog --backtitle "$BACKTITLE" --title "$title" --menu "$text" $((h+8)) 78 "$h" "$@" 3>&1 1>/dev/tty 2>&3) || rc=$?
+    # Box height and width 0 = sized by dialog to the text, the items and the terminal. A fixed
+    # height fails ("Can't make sub-window", exit 255) as soon as the text does not fit, and so
+    # does auto height with a fixed width. $h is the most list rows; longer lists scroll.
+    out=$(dialog --backtitle "$BACKTITLE" --title "$title" --menu "$text" 0 0 "$h" "$@" 3>&1 1>/dev/tty 2>&3) || rc=$?
+    # ESC also returns 255 but prints nothing; a dialog error message ends up in $out.
+    [[ ${rc:-0} -eq 255 && -n "$out" ]] && log "dialog error in menu '$title': $out"
     [[ ${rc:-0} -ne 0 ]] && return 1
     printf '%s' "$out"
 }
